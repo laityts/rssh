@@ -1,8 +1,12 @@
 # RSSH
 
+[English](README.md) | [中文](README_zh.md)
+
 SSH connection manager with a desktop GUI and built-in CLI.
 
 macOS / Windows / Linux / Android.
+
+> Read the story: [Why RSSH? — An SSH Client Born to be an AI Ops Assistant](docs/article_en.md) ([中文](docs/article_zh.md))
 
 ## Boom!
 
