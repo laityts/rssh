@@ -10,13 +10,18 @@ export interface SkillRecord {
   builtin: boolean;
 }
 
-export type LlmProvider = "anthropic" | "openai";
+export type LlmProvider = "anthropic" | "openai" | "deepseek" | "glm";
 
 export interface AiSettings {
   provider: LlmProvider;
   model: string;
   endpoint: string | null;
   has_api_key: boolean;
+}
+
+export interface ModelInfo {
+  id: string;
+  display_name: string | null;
 }
 
 export interface AiSessionInfo {
@@ -52,6 +57,8 @@ export interface CommandResult {
   id: string;
   exit_code: number;
   timed_out: boolean;
+  /** 用户在执行中点了"提前终止"。 */
+  early_terminated?: boolean;
   duration_ms: number;
   output: string;
   original_bytes: number;

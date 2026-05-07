@@ -1,8 +1,8 @@
 <script lang="ts">
-    import { onMount } from "svelte";
+    import { onMount, onDestroy } from "svelte";
     import * as ai from "../ai/store.svelte.ts";
     import { t, errMsg } from "../i18n/index.svelte.ts";
-    import type { LlmProvider, SkillRecord } from "../ai/types.ts";
+    import type { LlmProvider, ModelInfo, SkillRecord } from "../ai/types.ts";
 
     // ─── BYOK ─────────────────────────────────────────────────
     let provider = $state<LlmProvider>("anthropic");
@@ -12,11 +12,87 @@
     let hasKey = $state(false);
     let savingByok = $state(false);
     let byokNote = $state<string | null>(null);
+    let modelOptions = $state<ModelInfo[]>([]);
+    let loadingModels = $state(false);
+    /** byokNote 自清 timer 句柄，避免后续动作被旧 timer 误清。 */
+    let byokNoteTimer: number | null = null;
+    /** 切 provider 的代际号：在途的 loadSettings 解到一半时如果代际过期，丢弃结果。 */
+    let providerGen = 0;
 
-    const DEFAULTS = {
-        anthropic: { model: "claude-sonnet-4-6" },
-        openai: { model: "gpt-4o-mini" },
-    };
+    function setByokNote(msg: string | null, autoClearMs?: number) {
+        if (byokNoteTimer !== null) {
+            clearTimeout(byokNoteTimer);
+            byokNoteTimer = null;
+        }
+        byokNote = msg;
+        if (msg !== null && autoClearMs !== undefined) {
+            byokNoteTimer = window.setTimeout(() => {
+                byokNote = null;
+                byokNoteTimer = null;
+            }, autoClearMs);
+        }
+    }
+
+    /**
+     * 切换 provider：清空所有字段，从后端拉**该 provider** 已保存的快照回显。
+     * 没存过 → 字段保持空。这是用户唯一显式触发数据替换的入口，不再用 $effect 做隐式同步。
+     */
+    async function onProviderChange() {
+        const gen = ++providerGen;
+        setByokNote(null);
+        modelOptions = [];
+        apiKey = "";
+        model = "";
+        endpoint = "";
+        hasKey = false;
+        const s = await ai.loadSettings(provider);
+        if (gen !== providerGen) return; // 用户又切了，丢弃过期结果
+        model = s.model;
+        endpoint = s.endpoint ?? "";
+        hasKey = s.has_api_key;
+        if (hasKey) void autoLoadModels();
+    }
+
+    /** 静默拉取（失败不打扰）。供 onMount / 切换 provider / apiKey 失焦使用。 */
+    async function autoLoadModels() {
+        try {
+            const list = await ai.listModels(
+                provider,
+                apiKey.trim() || undefined,
+                endpoint.trim() || undefined,
+            );
+            modelOptions = list;
+        } catch {
+            // 没填 key、网络错等，不打扰用户。手动按钮会显示真实错误。
+        }
+    }
+
+    /** 显式按钮：失败要给反馈。 */
+    async function loadModels() {
+        if (!apiKey.trim() && !hasKey) {
+            setByokNote(t("ai.settings.note.api_key_required"));
+            return;
+        }
+        loadingModels = true;
+        setByokNote(null);
+        try {
+            const list = await ai.listModels(
+                provider,
+                apiKey.trim() || undefined,
+                endpoint.trim() || undefined,
+            );
+            modelOptions = list;
+            setByokNote(t("ai.settings.note.models_loaded", { count: list.length }), 2000);
+        } catch (e) {
+            setByokNote(t("ai.settings.note.models_failed", { error: errMsg(e) }));
+        } finally {
+            loadingModels = false;
+        }
+    }
+
+    function onApiKeyBlur() {
+        if (apiKey.trim()) void autoLoadModels();
+    }
 
     // ─── Skill 管理 ────────────────────────────────────────────
     let skills = $state<SkillRecord[]>([]);
@@ -41,7 +117,13 @@
         model = s.model;
         endpoint = s.endpoint ?? "";
         hasKey = s.has_api_key;
+        if (hasKey) void autoLoadModels();
         await refreshSkills();
+    });
+
+    onDestroy(() => {
+        if (byokNoteTimer !== null) clearTimeout(byokNoteTimer);
+        if (confirmDeleteTimer !== null) clearTimeout(confirmDeleteTimer);
     });
 
     async function refreshSkills() {
@@ -54,30 +136,24 @@
 
     async function saveByok() {
         savingByok = true;
-        byokNote = null;
+        setByokNote(null);
         try {
             await ai.saveSettings({
                 provider,
-                model,
+                model: model.trim(),
                 endpoint: endpoint.trim() || null,
-                apiKey: apiKey || null,
+                apiKey: apiKey.trim() || null,
             });
             const s = await ai.loadSettings();
             hasKey = s.has_api_key;
             apiKey = "";
-            byokNote = t("ai.settings.note.saved");
-            setTimeout(() => (byokNote = null), 2000);
+            setByokNote(t("ai.settings.note.saved"), 2000);
         } catch (e) {
-            byokNote = t("ai.settings.note.save_failed", { error: errMsg(e) });
+            setByokNote(t("ai.settings.note.save_failed", { error: errMsg(e) }));
         } finally {
             savingByok = false;
         }
     }
-
-    $effect(() => {
-        const d = DEFAULTS[provider];
-        if (!model) model = d.model;
-    });
 
     function newSkill() {
         editing = {
@@ -162,21 +238,21 @@
     <div class="warn">
         {t("ai.settings.warn.byok")}
         （<a href="https://www.anthropic.com/legal/privacy" target="_blank" rel="noopener">Anthropic</a>
-         / <a href="https://openai.com/policies/privacy-policy/" target="_blank" rel="noopener">OpenAI</a>）。
+         / <a href="https://openai.com/policies/privacy-policy/" target="_blank" rel="noopener">OpenAI</a>
+         / <a href="https://platform.deepseek.com/downloads" target="_blank" rel="noopener">DeepSeek</a>
+         / <a href="https://docs.bigmodel.cn/cn/terms/privacy-policy" target="_blank" rel="noopener">GLM</a>）。
     </div>
 
     <div class="section-label">{t("ai.settings.section.provider")}</div>
     <div class="form">
         <div class="row">
             <label for="ai-provider">{t("ai.settings.label.provider")}</label>
-            <select id="ai-provider" bind:value={provider}>
+            <select id="ai-provider" bind:value={provider} onchange={onProviderChange}>
                 <option value="anthropic">Anthropic (Claude)</option>
-                <option value="openai">{t("ai.settings.provider.openai_compat")}</option>
+                <option value="openai">OpenAI / {t("ai.settings.provider.openai_compat")}</option>
+                <option value="deepseek">DeepSeek</option>
+                <option value="glm">GLM (智谱)</option>
             </select>
-        </div>
-        <div class="row">
-            <label for="ai-model">{t("ai.settings.label.model")}</label>
-            <input id="ai-model" type="text" bind:value={model} placeholder={DEFAULTS[provider].model}/>
         </div>
         <div class="row">
             <label for="ai-endpoint">{t("ai.settings.label.endpoint")}</label>
@@ -185,10 +261,30 @@
         <div class="row">
             <label for="ai-apikey">{t("ai.settings.label.api_key")}</label>
             <input id="ai-apikey" type="password" bind:value={apiKey}
+                   onblur={onApiKeyBlur}
                    placeholder={hasKey ? t("ai.settings.placeholder.api_key_set") : t("ai.settings.placeholder.api_key_unset")}/>
         </div>
+        <div class="row">
+            <label for="ai-model">{t("ai.settings.label.model")}</label>
+            <div class="model-row">
+                <input id="ai-model" type="text" list="ai-model-options"
+                       bind:value={model} placeholder={t("ai.settings.placeholder.model")} required/>
+                <button type="button" class="btn btn-sm" onclick={loadModels}
+                        disabled={loadingModels}>
+                    {loadingModels ? t("ai.settings.btn.loading_models") : t("ai.settings.btn.load_models")}
+                </button>
+            </div>
+            {#if modelOptions.length > 0}
+                <datalist id="ai-model-options">
+                    {#each modelOptions as m (m.id)}
+                        <option value={m.id}>{m.display_name ?? m.id}</option>
+                    {/each}
+                </datalist>
+            {/if}
+        </div>
         <div class="actions">
-            <button class="btn btn-accent btn-sm" onclick={saveByok} disabled={savingByok}>
+            <button class="btn btn-accent btn-sm" onclick={saveByok}
+                    disabled={savingByok || !model.trim()}>
                 {savingByok ? t("ai.settings.btn.saving") : t("common.save")}
             </button>
             {#if byokNote}<span class="note">{byokNote}</span>{/if}
@@ -311,6 +407,12 @@
         resize: vertical;
         min-height: 240px;
     }
+    .model-row {
+        display: flex;
+        gap: 8px;
+        align-items: stretch;
+    }
+    .model-row input { flex: 1; }
 
     .actions {
         display: flex;

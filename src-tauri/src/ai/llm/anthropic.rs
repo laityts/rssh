@@ -12,11 +12,13 @@ use serde::Serialize;
 use serde_json::json;
 
 use super::{
-    ChatDelta, ChatMessage, ChatRequest, ChatResponse, DeltaSink, LlmClient, SseParser, ToolCall,
+    ChatDelta, ChatMessage, ChatRequest, ChatResponse, DeltaSink, LlmClient, ModelInfo, SseParser,
+    ToolCall,
 };
 use crate::error::{AppError, AppResult};
 
 const DEFAULT_ENDPOINT: &str = "https://api.anthropic.com/v1/messages";
+const MODELS_ENDPOINT: &str = "https://api.anthropic.com/v1/models";
 const API_VERSION: &str = "2023-06-01";
 
 pub struct AnthropicClient {
@@ -69,10 +71,66 @@ enum AnthropicBlock {
     },
 }
 
+impl AnthropicClient {
+    /// 把 messages endpoint 替换成 models endpoint。
+    /// 先归一化（去尾斜杠/空白），再判等比较——避免 `.../messages/` 这种尾斜杠落到错误分支。
+    fn models_url(&self) -> String {
+        let ep = self.endpoint.trim().trim_end_matches('/');
+        if ep == DEFAULT_ENDPOINT {
+            MODELS_ENDPOINT.to_string()
+        } else if let Some(base) = ep.strip_suffix("/messages") {
+            format!("{}/models", base.trim_end_matches('/'))
+        } else {
+            format!("{ep}/models")
+        }
+    }
+}
+
 #[async_trait]
 impl LlmClient for AnthropicClient {
     fn provider(&self) -> &'static str {
         "anthropic"
+    }
+
+    async fn list_models(&self) -> AppResult<Vec<ModelInfo>> {
+        let url = self.models_url();
+        let resp = self
+            .http
+            .get(&url)
+            .header("x-api-key", &self.api_key)
+            .header("anthropic-version", API_VERSION)
+            .header("accept", "application/json")
+            .send()
+            .await
+            .map_err(|e| {
+                AppError::other("llm_request_failed", json!({ "err": e.to_string() }))
+            })?;
+        let status = resp.status();
+        if !status.is_success() {
+            let text = resp.text().await.unwrap_or_default();
+            return Err(AppError::other(
+                "llm_error_status",
+                json!({ "status": status.to_string(), "text": text }),
+            ));
+        }
+        let v: serde_json::Value = resp
+            .json()
+            .await
+            .map_err(|e| AppError::other("llm_decode_failed", json!({ "err": e.to_string() })))?;
+        let data = v["data"].as_array().cloned().unwrap_or_default();
+        let mut models: Vec<ModelInfo> = data
+            .into_iter()
+            .filter_map(|m| {
+                let id = m.get("id")?.as_str()?.to_string();
+                let display_name = m
+                    .get("display_name")
+                    .and_then(|s| s.as_str())
+                    .map(|s| s.to_string());
+                Some(ModelInfo { id, display_name })
+            })
+            .collect();
+        models.sort_by(|a, b| a.id.cmp(&b.id));
+        Ok(models)
     }
 
     async fn chat(&self, req: ChatRequest, sink: DeltaSink) -> AppResult<ChatResponse> {
@@ -89,6 +147,7 @@ impl LlmClient for AnthropicClient {
                 ChatMessage::Assistant {
                     content,
                     tool_calls,
+                    reasoning_content: _, // Anthropic 不需要 OpenAI 协议下的 reasoning_content
                 } => {
                     let mut blocks: Vec<AnthropicBlock> = Vec::new();
                     if !content.is_empty() {
@@ -253,6 +312,7 @@ impl LlmClient for AnthropicClient {
             stop_reason,
             tokens_in,
             tokens_out,
+            reasoning_content: None,
         })
     }
 }
