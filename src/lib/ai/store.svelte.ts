@@ -237,10 +237,12 @@ export async function executeCommand(
     },
   };
 
-  // 写命令到 PTY；末尾 \n 触发 shell 执行。
+  // 写命令到 PTY；末尾 \r 等价于按下回车，触发 shell 执行。
+  // 不能用 \n：Windows ConPTY/PowerShell 只认 \r，Unix cooked PTY 会把 \r 经 ICRNL 翻成 \n，
+  // 所以 \r 是唯一跨平台正确的"回车"字节，和用户手按 Enter 时 xterm.js 发的字节一致。
   // 如果 invoke 抛错（session 已关闭等），listener / _runningExecutions 已经登记，
   // 必须走 finish() 清理一遍，否则会泄漏并让 isCommandRunning() 永远卡 true。
-  const data = Array.from(new TextEncoder().encode(proposed.full_cmd + "\n"));
+  const data = Array.from(new TextEncoder().encode(proposed.full_cmd + "\r"));
   try {
     await invoke(writeCmd, { sessionId: target_session_id, data });
   } catch (e) {
