@@ -10,6 +10,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { t, locale as currentLocale } from "../i18n/index.svelte.ts";
 import { extractOutput, findSentinel } from "./pty-output.ts";
+import { PROBE_COMMAND, classifyProbeBuffer } from "./shell-probe.ts";
 import type {
   AiSessionInfo,
   AiSettings,
@@ -186,75 +187,70 @@ export async function cancelStream(tab_id: string): Promise<void> {
   await invoke("ai_cancel_stream", { tabId: tab_id });
 }
 
-/** 探测远端 shell：发一行 `echo P=$PSEdition=$$=E` 到 PTY，listen 1.5s 解析输出。
- *
- *  返回 true = 探测成功并已 invoke ai_session_set_shell（后端 cache + actor 都更新）。
- *  返回 false = 超时 / classify 模糊 → 保持后端 POSIX 兜底，**不写 cache**（下次开 panel 可重探）。
- *
- *  时机：ChatPanel onMount / ensureSession 时，当 target=ssh + toggle on + cache miss。
- *  视觉代价：用户会看到一行 echo 命令滚过终端。这是把 toggle 开开的代价。
- *
- *  正则反查表（基于 *输出行* 的 group1/group2）：
- *    P=Desktop=*=E      → powershell (PS 5.1 Win / PS 7 Desktop edition)
- *    P=Core=*=E         → powershell (PS 7 Core edition, 跨平台)
- *    P=$PSEdition=$$=E  → cmd.exe (`$` 系变量全不展开)
- *    P==<数字>=E        → posix      (bash/zsh/sh/dash/ksh/csh/tcsh: $PSEdition 空, $$ 是 PID)
- *    其他               → null（不写 cache，下次重探）
- *
- *  PTY echo 坑：SSH 远端 PTY 默认 ECHO=on，会把我们粘进去的 `echo P=$PSEdition=$$=E`
- *  原样回响一遍。所以 buffer 通常有两处 marker 匹配——**第一处是 echo 回显**（POSIX/PS
- *  里 group1=`$PSEdition`），**第二处才是 shell 解析后的真实输出**。直接 `.match()` 会
- *  命中 echo 行把 POSIX/PS 误判为 cmd（Copilot PR review 指出的 bug）。
- *  → 用 `matchAll` 取第 2 个匹配。罕见 stty -echo 远端会只有 1 个匹配 → 超时兜底 POSIX。
- */
-export async function probeRemoteShell(
-  tab_id: string,
-  target_kind: "ssh" | "local",
-  target_id: string,
-): Promise<boolean> {
-  if (target_kind !== "ssh") return false; // local 已知，无需探测
-  const writeCmd = "ssh_write";
-  const dataEvent = `ssh:data:${target_id}`;
-  const PROBE = "echo P=$PSEdition=$$=E";
-  const RE_GLOBAL = /P=([^=]*)=([^=]*)=E/g;
+/** 连接时探测的门控：这个 SSH target 现在需要探测吗？
+ *  后端判定 auto_detect on + 会话存在 + 该 profile 缓存 miss。命中缓存或开关关 →
+ *  false，于是连接 / 重连都不会重复刷探针。本地 PTY 的 target_id 不在后端 sessions 里
+ *  → 自然 false。 */
+export async function remoteShellProbeNeeded(target_id: string): Promise<boolean> {
+  return invoke<boolean>("ai_remote_shell_probe_needed", { targetId: target_id });
+}
 
+/** SSH 连接成功后探测远端 shell：粘一行 `echo P=$PSEdition=$$=E` 到 PTY，listen 1.5s
+ *  解析输出，分类后写进程级缓存（ai_cache_remote_shell，key=profile_id）。AI session
+ *  启动时从缓存读初始 shell —— 探测与 AI 会话生命周期解耦，无需 tab_id / actor。
+ *
+ *  返回 true = 探测成功并已写缓存。false = 超时 / classify 模糊（不写缓存，下次连接重探）。
+ *
+ *  时机：TerminalPane.connectAndWire 的 SSH 成功分支，且 remoteShellProbeNeeded 为真。
+ *  init_command 已由后端在 ssh_connect 返回前写入 PTY，探针排在其后执行。
+ *  视觉代价：用户看到一行 echo 滚过终端 —— 每个 profile 每进程仅一次（缓存门控）。
+ *
+ *  分类规则（见 shell-probe.ts，纯逻辑 + 单测）：回显行被 `(?<!echo )` lookbehind 排除，
+ *  只认求值输出。powershell/posix 的求值签名一见即定；cmd 签名（== 被排除的回显签名）
+ *  只可能来自真 cmd.exe 的求值输出，且只在 deadline 才采纳——给 posix/ps 求值行先到的机会，
+ *  慢链路下求值行整个没到 → 不写缓存，POSIX 兜底重探（不会误缓存 cmd）。
+ */
+export async function probeRemoteShell(target_id: string): Promise<boolean> {
+  const dataEvent = `ssh:data:${target_id}`;
+  const cache = (shell: ShellKind) =>
+    // 后端按 target_id 查 profile_id 写缓存；target 已断则静默跳过。
+    invoke("ai_cache_remote_shell", { targetId: target_id, shell });
+
+  // Tail-bounded buffer: the probe echo + its evaluated output land at the END
+  // of the stream (after any MOTD / init_command noise), so only the recent tail
+  // matters. Cap it so a chatty connect can't grow an unbounded string that
+  // classifyProbeBuffer re-scans every 80ms. Trim on a newline boundary so a cut
+  // can never open a line mid-token and let `^P=` false-match a sliced echo line.
+  const TAIL_CAP = 16 * 1024;
   let buffer = "";
   const unlisten = await listen<number[]>(dataEvent, (e) => {
     buffer += new TextDecoder("utf-8", { fatal: false }).decode(new Uint8Array(e.payload));
+    if (buffer.length > TAIL_CAP) {
+      const tail = buffer.slice(-TAIL_CAP);
+      const nl = tail.indexOf("\n");
+      buffer = nl >= 0 ? tail.slice(nl + 1) : tail;
+    }
   });
   try {
-    await invoke(writeCmd, {
+    await invoke("ssh_write", {
       sessionId: target_id,
-      data: Array.from(new TextEncoder().encode(PROBE + "\r")),
+      data: Array.from(new TextEncoder().encode(PROBE_COMMAND + "\r")),
     });
     // 1.5s deadline：远端通常 100-300ms 内回响，给 5x 头量容忍慢链路。
     const deadline = Date.now() + 1500;
     while (Date.now() < deadline) {
-      const matches = [...buffer.matchAll(RE_GLOBAL)];
-      // 取**最后一处**匹配 —— 兼顾两种 PTY 模式：
-      //   ECHO=on（默认）：[echo 回显, shell 输出] → last = shell 输出 ✓
-      //   ECHO=off（stty -echo 罕见）: [shell 输出] → last = shell 输出 ✓
-      // Copilot PR review 的优化：之前 hard-require >=2 会让 ECHO=off 远端永远超时。
-      if (matches.length >= 1) {
-        const [, psed, dollar] = matches[matches.length - 1];
-        const kind = classifyShell(psed, dollar);
-        if (kind === null) {
-          // 命中但 classify 模糊（如 PS 4.x：$PSEdition 不存在，$$ 是脏值）。
-          // 不调 set_shell 不写 cache —— 让下次开 panel 还能再试，避免锁错 shell。
-          console.warn(
-            "[ai] shell probe matched ambiguous signature, keeping POSIX fallback (not cached):",
-            { group1: psed, group2: dollar },
-          );
-          return false;
-        }
-        await invoke("ai_session_set_shell", {
-          tabId: tab_id,
-          targetId: target_id, // 让后端校验 target 没变（防 rebind/重连期间 stale probe）
-          shell: kind,
-        });
+      const { kind } = classifyProbeBuffer(buffer);
+      if (kind) {
+        await cache(kind); // posix/powershell 的求值行无歧义，立即定夺
         return true;
       }
       await new Promise((r) => setTimeout(r, 80));
+    }
+    // 超时：没等到 posix/powershell 求值行。若 buffer 里有（非回显的）cmd 求值签名 → 真 cmd.exe；
+    // 慢链路下求值行整个没到（只有被 lookbehind 排除的回显）→ cmd=false → 不写缓存，POSIX 兜底。
+    if (classifyProbeBuffer(buffer).cmd) {
+      await cache("cmd");
+      return true;
     }
     console.warn("[ai] shell probe timed out — keeping POSIX fallback");
     return false;
@@ -264,19 +260,6 @@ export async function probeRemoteShell(
   } finally {
     unlisten();
   }
-}
-
-/** 反查表：未识别返回 null（不写 cache，下次重探）。参考 probeRemoteShell 顶部对照表。 */
-function classifyShell(psed: string, dollar: string): ShellKind | null {
-  // PS 5+ 内置 $PSEdition 是 'Desktop' (Win PS) 或 'Core' (PS 7 Core)
-  if (psed === "Desktop" || psed === "Core") return "powershell";
-  // cmd.exe 完全不识别 `$`-style 变量，全字面输出
-  if (psed === "$PSEdition" && dollar === "$$") return "cmd";
-  // POSIX: $PSEdition 未定义展开为空，$$ 是 shell PID（数字）
-  if (psed === "" && /^\d+$/.test(dollar)) return "posix";
-  // 模糊：PS 4.x（$PSEdition 不存在）/ fish $$ 报错残留 / 自定义 prompt 干扰
-  // 不强行猜——返回 null，调用方走"不写 cache 不锁"分支，下次能重探。
-  return null;
 }
 
 /** 当前会话的助手消息是否正在流式输出 —— UI 用它把"发送"按钮切成"停止"。 */
