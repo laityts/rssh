@@ -72,6 +72,45 @@ pub fn secret_backend(state: State<AppState>) -> String {
     state.secret_store.backend_name().to_string()
 }
 
+/// One installed font family + whether it is monospaced. The frontend uses
+/// `monospaced` as a client-side filter (the "monospace only" toggle) and
+/// prepends the chosen family to the terminal's base font stack.
+#[derive(serde::Serialize)]
+pub struct FontInfo {
+    pub family: String,
+    pub monospaced: bool,
+}
+
+/// List installed font families for the terminal-font picker. Collapses faces
+/// to families; a family counts as monospaced if any of its faces reports the
+/// fixed-pitch flag. Sorted + deduped via BTreeMap. Pure system query — no
+/// state, no persistence. WKWebView has no Local Font Access API, so font
+/// enumeration must happen here in Rust rather than in the webview.
+#[tauri::command]
+pub async fn list_fonts() -> Vec<FontInfo> {
+    // Enumeration scans the system font dirs and parses face headers — blocking
+    // work, so run it off the async runtime's worker threads (keeps other
+    // commands responsive). Sync Tauri commands already run off the UI thread,
+    // so this is correctness/tidiness, not a UI-freeze fix.
+    tauri::async_runtime::spawn_blocking(|| {
+        let mut db = fontdb::Database::new();
+        db.load_system_fonts();
+        let mut families: std::collections::BTreeMap<String, bool> =
+            std::collections::BTreeMap::new();
+        for face in db.faces() {
+            if let Some((name, _)) = face.families.first() {
+                *families.entry(name.clone()).or_insert(false) |= face.monospaced;
+            }
+        }
+        families
+            .into_iter()
+            .map(|(family, monospaced)| FontInfo { family, monospaced })
+            .collect()
+    })
+    .await
+    .unwrap_or_default()
+}
+
 #[tauri::command]
 pub fn list_recordings(state: State<AppState>) -> AppResult<Vec<String>> {
     let dir = recording_dir(&state)?;
