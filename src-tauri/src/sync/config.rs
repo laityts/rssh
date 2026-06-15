@@ -1,7 +1,8 @@
 //! Config sync: incremental merge (upsert by identity), never destructive.
 //!
 //! **merge_import** is the single import entry point for every path — file
-//! `import` / `rssh config import` AND `github_pull` / `rssh config pull`.
+//! `import` / `rssh config import` AND `github_pull` / `webdav_pull` /
+//! `rssh config github pull` / `rssh config webdav pull`.
 //! It does NOT clear local data: each entity is upserted by its identity key,
 //! local-only entities survive, and a delete on one device is never propagated
 //! to another (additive semantics — the deliberate trade-off chosen for sync).
@@ -379,14 +380,15 @@ pub struct SyncPrefs {
 pub enum ExportMode {
     /// Full local backup: every category, every secret, no toggles.
     LocalBackup,
-    /// GitHub push: apply per-category toggles + group filter; scrub the secret
-    /// of credentials flagged local-only.
-    GitHubPush(SyncPrefs),
+    /// Remote push (GitHub / WebDAV): apply per-category toggles + group filter;
+    /// scrub the secret of credentials flagged local-only.
+    RemotePush(SyncPrefs),
 }
 
-/// Read the per-category toggles + profile group filter from settings. Both the
-/// GUI push and `rssh config push` feed the result into `build_payload` so the
-/// same opt-outs apply no matter which transport pushes to the shared repo.
+/// Read the per-category toggles + profile group filter from settings. The GUI
+/// and `rssh config github push` / `rssh config webdav push` both feed the
+/// result into `build_payload` so the same opt-outs apply no matter which
+/// remote transport pushes to the shared repo / WebDAV endpoint.
 pub fn read_sync_prefs(db: &Db) -> AppResult<SyncPrefs> {
     // Absent or any value other than "0" → on. Only an explicit "0" disables.
     let flag = |key: &str| -> AppResult<bool> {
@@ -435,7 +437,7 @@ fn collect_credentials_with_secrets(
 }
 
 /// Build the export payload as a JSON value — the single source of truth for
-/// the sync shape, shared by local export AND GitHub push (GUI *and* CLI) so the
+/// the sync shape, shared by local export AND remote push (GUI *and* CLI) so the
 /// JSON can't drift between them. On push, a disabled category's key is simply
 /// omitted (absence = "not synced"); merge_import then leaves that local table
 /// alone. `data_dir` feeds the file-backed `snippets` category.
@@ -446,7 +448,7 @@ pub fn build_payload(
     mode: &ExportMode,
 ) -> AppResult<Value> {
     let prefs = match mode {
-        ExportMode::GitHubPush(p) => Some(p),
+        ExportMode::RemotePush(p) => Some(p),
         ExportMode::LocalBackup => None,
     };
     let on = |pick: fn(&SyncPrefs) -> bool| prefs.is_none_or(pick);
