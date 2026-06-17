@@ -18,6 +18,15 @@
     import {createFoldStore, type FoldStore} from "../terminal/folds.ts";
     import {extractBlocksText} from "../terminal/block-content.ts";
     import {renderBlocksToBlob} from "../terminal/block-to-image.ts";
+    import {
+        MOBILE_TOUCH_LONG_PRESS_MS,
+        createMobileTerminalGesture,
+        markMobileTerminalLongPress,
+        shouldDeferMobileTerminalScrollReset,
+        shouldOpenMobileTerminalKeyboard,
+        updateMobileTerminalGesture,
+        type MobileTerminalGesture,
+    } from "../terminal/mobile-touch.ts";
     import {inputNewline, normalizeIncoming, bytesToHex, parseHexInput, parseLoginScript, remapEditingKeys, normalizeOutgoing, type LoginStep} from "../terminal/serial-transforms.ts";
     import {compileHighlightRules, type CompiledHighlightRule} from "../terminal/highlight.ts";
     import {HighlightDecorator} from "../terminal/highlight-decorations.ts";
@@ -867,24 +876,17 @@
     }
 
     function setupMobileSoftKeyboard(helper: HTMLTextAreaElement) {
-        const longPressMs = 360;
-        const moveSlopPx = 12;
         const originalHelperStyle = helper.getAttribute("style");
         let scrollResetRaf = 0;
         let helperPinRaf = 0;
-        let gesture: {
-            pointerId: number;
-            x: number;
-            y: number;
-            longPress: boolean;
-            moved: boolean;
-            timer: number | undefined;
-        } | null = null;
+        let gesture: (MobileTerminalGesture & { timer: number | undefined }) | null = null;
 
         function resetDocumentScroll() {
+            if (shouldDeferMobileTerminalScrollReset(gesture)) return;
             if (scrollResetRaf) return;
             scrollResetRaf = requestAnimationFrame(() => {
                 scrollResetRaf = 0;
+                if (shouldDeferMobileTerminalScrollReset(gesture)) return;
                 if (window.scrollX !== 0 || window.scrollY !== 0) window.scrollTo(0, 0);
                 document.documentElement.scrollTop = 0;
                 document.documentElement.scrollLeft = 0;
@@ -989,33 +991,27 @@
             if (!shouldHandleTouch(ev)) return;
             clearGestureTimer();
             gesture = {
-                pointerId: ev.pointerId,
-                x: ev.clientX,
-                y: ev.clientY,
-                longPress: false,
-                moved: false,
+                ...createMobileTerminalGesture(ev.pointerId, ev.clientX, ev.clientY),
                 timer: undefined,
             };
             gesture.timer = window.setTimeout(() => {
                 if (!gesture || gesture.pointerId !== ev.pointerId) return;
-                gesture.longPress = true;
+                markMobileTerminalLongPress(gesture);
                 hideKeyboard();
-            }, longPressMs);
+            }, MOBILE_TOUCH_LONG_PRESS_MS);
         }
 
         function onPointerMove(ev: PointerEvent) {
             if (!gesture || gesture.pointerId !== ev.pointerId) return;
-            const dx = ev.clientX - gesture.x;
-            const dy = ev.clientY - gesture.y;
-            if (Math.hypot(dx, dy) <= moveSlopPx) return;
-            gesture.moved = true;
+            const update = updateMobileTerminalGesture(gesture, ev.clientX, ev.clientY);
+            if (update === "idle") return;
             clearGestureTimer();
             hideKeyboard();
         }
 
         function onPointerUp(ev: PointerEvent) {
             if (!gesture || gesture.pointerId !== ev.pointerId) return;
-            const shouldOpenKeyboard = !gesture.longPress && !gesture.moved;
+            const shouldOpenKeyboard = shouldOpenMobileTerminalKeyboard(gesture);
             clearGestureTimer();
             gesture = null;
             if (shouldOpenKeyboard) showKeyboard();
@@ -1482,6 +1478,12 @@
         background-color: var(--term-bg) !important;
     }
 
+    .term-wrap.is-mobile :global(.xterm-viewport) {
+        touch-action: pan-y;
+        overscroll-behavior: contain;
+        -webkit-overflow-scrolling: touch;
+    }
+
     .xterm-host {
         width: 100%;
         height: 100%;
@@ -1507,6 +1509,26 @@
        layout box (real rect, input works) while hiding the paint. */
     .term-wrap.is-mobile :global(.composition-view) {
         visibility: hidden !important;
+    }
+
+    @media (pointer: coarse) {
+        .term-wrap.is-mobile :global(.xterm-viewport::-webkit-scrollbar) {
+            width: 14px;
+        }
+
+        .term-wrap.is-mobile :global(.xterm-viewport::-webkit-scrollbar-thumb) {
+            min-height: 44px;
+            border: 4px solid transparent;
+            border-radius: 999px;
+            background: color-mix(in srgb, var(--text-dim) 70%, transparent);
+            background-clip: padding-box;
+        }
+
+        .term-wrap.is-mobile :global(.xterm-viewport::-webkit-scrollbar-thumb:hover),
+        .term-wrap.is-mobile :global(.xterm-viewport::-webkit-scrollbar-thumb:active) {
+            background: color-mix(in srgb, var(--text-sub) 85%, transparent);
+            background-clip: padding-box;
+        }
     }
 
     /* Overlay painted inside the enlarged left padding. SVG itself ignores
