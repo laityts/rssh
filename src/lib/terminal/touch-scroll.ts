@@ -32,6 +32,35 @@ export function accumulateScroll(
   return { lines, remainder: total - lines * rowHeight };
 }
 
+/**
+ * Build the cursor-key bytes a drag should send to a full-screen app running in
+ * the alternate screen buffer (Claude Code, vim, less, fzf, …). That buffer has
+ * NO scrollback, so terminal.scrollLines() is a no-op there — the app owns
+ * scrolling and only moves when it receives Up/Down keys. Desktop gets this for
+ * free: xterm's built-in wheel handler falls back to arrow keys when there's no
+ * scrollback, but our touch handler bypasses that path, so we synthesize it.
+ *
+ * `lines` follows accumulateScroll's sign: positive = finger moved down = reveal
+ * EARLIER content = scroll up = Up arrow; negative = Down arrow. The DECCKM
+ * (application-cursor-keys) mode picks the CSI vs SS3 prefix, exactly as a real
+ * arrow keypress would — apps in that mode reject the wrong form.
+ *
+ * `maxKeys` caps a single fling frame so a flick can't fire hundreds of keys at
+ * a TUI at once (each key is a discrete list-move for the app).
+ */
+export function cursorKeySeq(
+  lines: number,
+  applicationCursorKeys: boolean,
+  maxKeys: number,
+): string {
+  if (lines === 0) return "";
+  const count = Math.min(Math.abs(lines), Math.max(0, maxKeys));
+  if (count === 0) return "";
+  const prefix = applicationCursorKeys ? "\x1bO" : "\x1b[";
+  const key = prefix + (lines > 0 ? "A" : "B"); // A = Up, B = Down
+  return key.repeat(count);
+}
+
 // Tunables (device-feel; adjust on real hardware). Velocity is px/ms.
 // Keep TAKEOVER_PX == the soft-keyboard handler's moveSlopPx (12, in TerminalPane)
 // AND match its boundary: we claim only when travel EXCEEDS it (the check below uses
@@ -42,6 +71,7 @@ const FLING_MIN_V = 0.12; // release faster than this (~120 px/s) starts a fling
 const STOP_V = 0.02;      // fling ends once it decays below this (~20 px/s)
 const FRICTION = 0.94;    // per-60fps-frame velocity decay (frame-rate normalized)
 const PAUSE_MS = 60;      // finger paused longer than this before release → no fling
+const MAX_KEYS_PER_STEP = 8; // alt-buffer: cap arrow keys emitted per drag/fling frame
 
 /**
  * Wire one-finger vertical drag → scrollback on `host` (the element passed to
@@ -52,8 +82,17 @@ const PAUSE_MS = 60;      // finger paused longer than this before release → n
  * selection) still pass through untouched; only a real drag scrolls. A new
  * touch cancels any in-flight fling (grab-to-stop, like native lists).
  * Caller decides when to install it (e.g. mobile only).
+ *
+ * `onData`: optional PTY sink. When provided, drags over the alternate screen
+ * buffer are sent to the app as cursor keys (that buffer has no scrollback);
+ * without it, alt-buffer drags fall back to scrollLines (a no-op there) — used
+ * by the playback screen, which has no live PTY to key.
  */
-export function setupTouchScroll(host: HTMLElement, terminal: Terminal): () => void {
+export function setupTouchScroll(
+  host: HTMLElement,
+  terminal: Terminal,
+  onData?: (data: string) => void,
+): () => void {
   let startY = 0;
   let lastY = 0;
   let remainder = 0;   // sub-row px carried across moves AND into the fling
@@ -74,10 +113,21 @@ export function setupTouchScroll(host: HTMLElement, terminal: Terminal): () => v
   }
 
   // Finger down (dy>0) = reveal earlier output = scroll up → negate.
+  // In the alternate screen buffer (full-screen TUI: Claude Code, vim, …) there
+  // is no scrollback, so scrollLines does nothing — the app scrolls only when it
+  // receives arrow keys. Route drag travel there as cursor keys instead. onData
+  // is caller-supplied so the playback screen (no PTY) can leave it undefined and
+  // keep the scrollLines-only behavior.
   function scrollByPx(px: number) {
     const r = accumulateScroll(remainder, px, rowH);
     remainder = r.remainder;
-    if (r.lines !== 0) terminal.scrollLines(-r.lines);
+    if (r.lines === 0) return;
+    if (onData && terminal.buffer.active.type === "alternate") {
+      const seq = cursorKeySeq(r.lines, terminal.modes.applicationCursorKeysMode, MAX_KEYS_PER_STEP);
+      if (seq) onData(seq);
+    } else {
+      terminal.scrollLines(-r.lines);
+    }
   }
 
   function cancelInertia() {

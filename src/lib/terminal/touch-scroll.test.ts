@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { accumulateScroll } from "./touch-scroll.ts";
+import { accumulateScroll, cursorKeySeq } from "./touch-scroll.ts";
 
 describe("accumulateScroll", () => {
   it("holds sub-row travel as remainder, scrolls nothing yet", () => {
@@ -30,5 +30,34 @@ describe("accumulateScroll", () => {
 
   it("is a no-op when row height is unknown (0), preserving remainder", () => {
     expect(accumulateScroll(7, 100, 0)).toEqual({ lines: 0, remainder: 7 });
+  });
+});
+
+describe("cursorKeySeq", () => {
+  it("positive lines (finger down = scroll up) → Up arrows", () => {
+    // reveal earlier content; normal (CSI) cursor mode
+    expect(cursorKeySeq(3, false, 8)).toBe("\x1b[A\x1b[A\x1b[A");
+  });
+
+  it("negative lines → Down arrows", () => {
+    expect(cursorKeySeq(-2, false, 8)).toBe("\x1b[B\x1b[B");
+  });
+
+  it("uses SS3 (ESC O) prefix in application-cursor-keys mode", () => {
+    expect(cursorKeySeq(1, true, 8)).toBe("\x1bOA");
+    expect(cursorKeySeq(-1, true, 8)).toBe("\x1bOB");
+  });
+
+  it("emits nothing for zero travel", () => {
+    expect(cursorKeySeq(0, false, 8)).toBe("");
+  });
+
+  it("caps the number of keys per step (fling flood guard)", () => {
+    expect(cursorKeySeq(100, false, 3)).toBe("\x1b[A\x1b[A\x1b[A");
+  });
+
+  it("emits nothing when the cap is zero or negative", () => {
+    expect(cursorKeySeq(5, false, 0)).toBe("");
+    expect(cursorKeySeq(5, false, -1)).toBe("");
   });
 });
