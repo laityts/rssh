@@ -1,5 +1,36 @@
 import { describe, it, expect } from "vitest";
-import { accumulateScroll } from "./touch-scroll.ts";
+import { accumulateScroll, resolveScrollTarget, arrowSeq } from "./touch-scroll.ts";
+
+describe("resolveScrollTarget", () => {
+  it("routes a plain shell (scrollback, no alt, no mouse) to scrollback", () => {
+    expect(resolveScrollTarget(false, false)).toBe("scrollback");
+  });
+
+  it("routes a pager (alt-screen, no mouse tracking) to arrow keys", () => {
+    expect(resolveScrollTarget(false, true)).toBe("arrows");
+  });
+
+  it("routes a mouse-tracking TUI (Claude Code) to synthetic wheel events", () => {
+    expect(resolveScrollTarget(true, true)).toBe("wheel");
+  });
+
+  it("prefers wheel over scrollback when an app tracks the mouse in the normal buffer", () => {
+    // mouse tracking wins regardless of buffer: the app asked for the events.
+    expect(resolveScrollTarget(true, false)).toBe("wheel");
+  });
+});
+
+describe("arrowSeq", () => {
+  it("emits CSI arrows in normal cursor-key mode", () => {
+    expect(arrowSeq(true, false)).toBe("\x1b[A");
+    expect(arrowSeq(false, false)).toBe("\x1b[B");
+  });
+
+  it("emits SS3 arrows under DECCKM (application cursor keys)", () => {
+    expect(arrowSeq(true, true)).toBe("\x1bOA");
+    expect(arrowSeq(false, true)).toBe("\x1bOB");
+  });
+});
 
 describe("accumulateScroll", () => {
   it("holds sub-row travel as remainder, scrolls nothing yet", () => {
