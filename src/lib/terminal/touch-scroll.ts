@@ -7,11 +7,50 @@ import type { Terminal } from "@xterm/xterm";
  * path at all. This adds drag-to-scroll plus the fling momentum that every
  * native scroll surface has.
  *
- * `accumulateScroll` is the pure, unit-tested core (px travel → whole lines),
+ * Where the scroll GOES depends on what the terminal is running, mirroring
+ * exactly what xterm's own wheel handler does for a desktop physical wheel:
+ *
+ *   - Mouse-tracking apps (Claude Code, vim `:set mouse=a`, tmux, zellij) run
+ *     in the alternate screen AND ask to receive mouse events. They have no
+ *     xterm scrollback, so scrollLines() is a no-op — the app scrolls its OWN
+ *     view when it gets wheel reports. We synthesize WheelEvents on the xterm
+ *     element and let xterm encode them (SGR/X10/…, per the app's protocol).
+ *   - Alternate-screen apps WITHOUT mouse tracking (less, man, git log's
+ *     pager) scroll on arrow keys, so we send cursor-up/down — matching
+ *     xterm's own fallback for that case.
+ *   - Everything else (normal shell, codex) has real scrollback: scrollLines().
+ *
+ * `accumulateScroll` and `resolveScrollTarget` are the pure, unit-tested core,
  * shared by both the live drag and the inertia frames. `setupTouchScroll` is
  * the DOM glue, kept here so both terminal hosts (TerminalPane, PlaybackScreen)
  * share one implementation.
  */
+
+export type ScrollTarget = "scrollback" | "wheel" | "arrows";
+
+/**
+ * Decide where a scroll gesture should go, mirroring xterm's desktop wheel
+ * handler. Mouse tracking wins over alt-screen: an app that both switched to
+ * the alt buffer and enabled mouse reports (the TUI case) wants the wheel
+ * events, not synthetic arrows.
+ */
+export function resolveScrollTarget(
+  mouseTracking: boolean,
+  altBuffer: boolean,
+): ScrollTarget {
+  if (mouseTracking) return "wheel";
+  if (altBuffer) return "arrows";
+  return "scrollback";
+}
+
+/**
+ * Cursor-key sequence for one line of pager scroll. DECCKM (application cursor
+ * keys) picks SS3 (ESC O x) over CSI (ESC [ x) — the same rule xterm uses when
+ * it falls back to arrows on a wheel in a no-scrollback buffer.
+ */
+export function arrowSeq(up: boolean, appCursorKeys: boolean): string {
+  return (appCursorKeys ? "\x1bO" : "\x1b[") + (up ? "A" : "B");
+}
 
 /**
  * Convert accumulated travel (px) into whole terminal lines, carrying the
@@ -56,6 +95,7 @@ const PAUSE_MS = 60;      // finger paused longer than this before release → n
 export function setupTouchScroll(host: HTMLElement, terminal: Terminal): () => void {
   let startY = 0;
   let lastY = 0;
+  let lastX = 0;      // clientX of the finger, for synthetic wheel-event coords
   let remainder = 0;   // sub-row px carried across moves AND into the fling
   let rowH = 0;        // px, sampled once per gesture (see measureRowHeight)
   let active = false;  // gesture claimed as a scroll (finger down)
@@ -73,11 +113,54 @@ export function setupTouchScroll(host: HTMLElement, terminal: Terminal): () => v
     return row?.offsetHeight ?? 0;
   }
 
-  // Finger down (dy>0) = reveal earlier output = scroll up → negate.
+  // Safety cap: one fling/drag frame can't dispatch an unbounded burst of
+  // synthetic wheel events or arrow bytes (a runaway velocity would flood the
+  // PTY). Real gestures stay well under this.
+  const MAX_LINES_PER_CALL = 100;
+
+  // Send one line of app-scroll as a synthetic WheelEvent on xterm's element,
+  // reusing xterm's own mouse-protocol encoding (SGR/X10/…). deltaMode=LINE so
+  // coreMouseService.consumeWheelEvent returns a whole line (its gate only needs
+  // non-zero; xterm then emits one wheel-button report regardless of magnitude).
+  // Coords must land inside the screen or getMouseReportCoords rejects the event.
+  function dispatchWheelLine(up: boolean) {
+    const el = terminal.element;
+    if (!el) return;
+    const rect = el.getBoundingClientRect();
+    const clientX = Math.min(Math.max(lastX, rect.left + 1), rect.right - 1);
+    const clientY = Math.min(Math.max(lastY, rect.top + 1), rect.bottom - 1);
+    el.dispatchEvent(new WheelEvent("wheel", {
+      deltaY: up ? -1 : 1,
+      deltaMode: WheelEvent.DOM_DELTA_LINE,
+      clientX,
+      clientY,
+      bubbles: true,
+      cancelable: true,
+    }));
+  }
+
+  // Finger down (dy>0) → r.lines>0 → reveal earlier output = scroll up.
+  // Route the same intent three ways, mirroring xterm's desktop wheel handler:
+  // real scrollback, app wheel reports, or pager arrow keys.
   function scrollByPx(px: number) {
     const r = accumulateScroll(remainder, px, rowH);
     remainder = r.remainder;
-    if (r.lines !== 0) terminal.scrollLines(-r.lines);
+    if (r.lines === 0) return;
+    const mouseTracking = terminal.modes.mouseTrackingMode !== "none";
+    const altBuffer = terminal.buffer.active.type === "alternate";
+    const target = resolveScrollTarget(mouseTracking, altBuffer);
+    if (target === "scrollback") {
+      terminal.scrollLines(-r.lines);
+      return;
+    }
+    const up = r.lines > 0;
+    const count = Math.min(Math.abs(r.lines), MAX_LINES_PER_CALL);
+    if (target === "wheel") {
+      for (let i = 0; i < count; i++) dispatchWheelLine(up);
+    } else {
+      const seq = arrowSeq(up, terminal.modes.applicationCursorKeysMode);
+      terminal.input(seq.repeat(count), true);
+    }
   }
 
   function cancelInertia() {
@@ -106,6 +189,7 @@ export function setupTouchScroll(host: HTMLElement, terminal: Terminal): () => v
     ignore = e.touches.length !== 1;
     if (ignore) return;
     startY = lastY = e.touches[0].clientY;
+    lastX = e.touches[0].clientX;
     lastMoveTime = performance.now();
     remainder = 0;
   }
@@ -133,6 +217,7 @@ export function setupTouchScroll(host: HTMLElement, terminal: Terminal): () => v
     velocity = velocity * 0.2 + (dy / dt) * 0.8; // EMA, recent-biased for fling
     lastMoveTime = now;
     lastY = y;
+    lastX = e.touches[0].clientX;
     scrollByPx(dy);
   }
 
