@@ -1518,7 +1518,16 @@
             // 与上面的 pointer 键盘状态机正交：靠"位移超阈值才接管"避开点按(弹键盘)和
             // 长按(选字)。代价：长按选中后再拖动会变成滚动而非扩展选区——移动端有
             // 块复制 / 发 AI 取文，这个取舍可接受。
-            mobileTouchScrollCleanup = setupTouchScroll(containerEl, terminal);
+            //
+            // suppressArrowInput：备用屏无鼠标追踪的 app 靠注入 ↑/↓ 滚动，但那是
+            // 真实 PTY 输入。用户正在打字（IME 组字 / 软键盘弹起 → helper 持有焦点）
+            // 时抑制注入，否则滚动手势会给绑定 ↑/↓ 到历史回溯的 app 灌回上一条输入，
+            // 把输入框搞乱。组字必然要求 helper focus，所以焦点检查已覆盖 IME 场景。
+            mobileTouchScrollCleanup = setupTouchScroll(
+                containerEl,
+                terminal,
+                () => !!helper && document.activeElement === helper,
+            );
         }
 
         app.registerTerminalControls(tabId, {
