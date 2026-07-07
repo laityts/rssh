@@ -17,7 +17,10 @@ import type { Terminal } from "@xterm/xterm";
  *     element and let xterm encode them (SGR/X10/…, per the app's protocol).
  *   - Alternate-screen apps WITHOUT mouse tracking (less, man, git log's
  *     pager) scroll on arrow keys, so we send cursor-up/down — matching
- *     xterm's own fallback for that case.
+ *     xterm's own fallback for that case. Those arrows are REAL PTY input, so
+ *     the caller can pass `suppressArrowInput` to gate them off while the user
+ *     is typing (IME composing / soft keyboard up) — otherwise a scroll gesture
+ *     would refill the input line of an app that binds ↑/↓ to history recall.
  *   - Everything else (normal shell, codex) has real scrollback: scrollLines().
  *
  * `accumulateScroll` and `resolveScrollTarget` are the pure, unit-tested core,
@@ -91,8 +94,19 @@ const PAUSE_MS = 60;      // finger paused longer than this before release → n
  * selection) still pass through untouched; only a real drag scrolls. A new
  * touch cancels any in-flight fling (grab-to-stop, like native lists).
  * Caller decides when to install it (e.g. mobile only).
+ *
+ * `suppressArrowInput`, when supplied and returning true, gates OFF the pager
+ * arrow-key path (alt-screen, no mouse tracking) for the duration of the check
+ * — the gesture then scrolls nothing rather than injecting ↑/↓ into the PTY.
+ * Wheel and scrollback are never gated: wheel means the app explicitly asked
+ * for mouse reports, and scrollback never touches PTY input. Use it to stop a
+ * scroll from clobbering the input line while the user is composing / typing.
  */
-export function setupTouchScroll(host: HTMLElement, terminal: Terminal): () => void {
+export function setupTouchScroll(
+  host: HTMLElement,
+  terminal: Terminal,
+  suppressArrowInput?: () => boolean,
+): () => void {
   let startY = 0;
   let lastY = 0;
   let lastX = 0;      // clientX of the finger, for synthetic wheel-event coords
@@ -156,8 +170,16 @@ export function setupTouchScroll(host: HTMLElement, terminal: Terminal): () => v
     const up = r.lines > 0;
     const count = Math.min(Math.abs(r.lines), MAX_LINES_PER_CALL);
     if (target === "wheel") {
+      // App enabled mouse tracking → it asked for wheel reports; always safe.
       for (let i = 0; i < count; i++) dispatchWheelLine(up);
     } else {
+      // "arrows" is REAL PTY input. For a pager it scrolls; but for any
+      // alt-screen app that binds ↑/↓ to history recall or cursor motion it
+      // would corrupt the input line — and we can't tell them apart from the
+      // terminal state. So when the user is actively typing (IME composing /
+      // soft keyboard up), suppress the injection: no scroll beats a garbled
+      // input box. Real pagers don't hold an open text field, so nothing lost.
+      if (suppressArrowInput?.()) return;
       const seq = arrowSeq(up, terminal.modes.applicationCursorKeysMode);
       terminal.input(seq.repeat(count), true);
     }
