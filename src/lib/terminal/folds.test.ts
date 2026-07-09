@@ -19,12 +19,25 @@ interface FakeMarker {
   dispose(): void;
 }
 
-function fakeTerm(opts: { rows: number; initialLines: number; cursorY: number; ybase?: number }) {
+interface FakeLine {
+  content: string;
+  isWrapped?: boolean;
+  getTrimmedLength?: () => number;
+}
+
+function fakeBlankLine(): FakeLine {
+  const line: FakeLine = { content: "<blank>", isWrapped: false };
+  line.getTrimmedLength = () => line.content === "<blank>" ? 0 : line.content.length;
+  return line;
+}
+
+function fakeTerm(opts: { rows: number; initialLines: number; cursorY: number; ybase?: number; maxLength?: number }) {
   const rows = opts.rows;
+  const maxLength = opts.maxLength;
   let ybase = opts.ybase ?? 0;
   let ydisp = ybase;
   let y = opts.cursorY;
-  const lineArray: { content: string }[] = [];
+  const lineArray: FakeLine[] = [];
   for (let i = 0; i < opts.initialLines; i++) lineArray.push({ content: `L${i}` });
 
   let markerSeq = 0;
@@ -51,6 +64,21 @@ function fakeTerm(opts: { rows: number; initialLines: number; cursorY: number; y
     return m;
   };
 
+  function trimHead(count: number) {
+    if (count <= 0) return;
+    lineArray.splice(0, count);
+    for (const m of markers) {
+      if (m.isDisposed) continue;
+      m.line -= count;
+      if (m.line < 0) m.dispose();
+    }
+  }
+
+  function enforceMaxLength() {
+    if (!maxLength || lineArray.length <= maxLength) return;
+    trimHead(lineArray.length - maxLength);
+  }
+
   // CircularList 的子集 + xterm Buffer.addMarker 内嵌的迁移逻辑
   const lines = {
     get length() {
@@ -59,7 +87,7 @@ function fakeTerm(opts: { rows: number; initialLines: number; cursorY: number; y
     get(i: number) {
       return lineArray[i];
     },
-    splice(start: number, deleteCount: number, ...items: { content: string }[]) {
+    splice(start: number, deleteCount: number, ...items: FakeLine[]) {
       // Delete 阶段
       if (deleteCount > 0) {
         const removed = lineArray.splice(start, deleteCount);
@@ -77,9 +105,10 @@ function fakeTerm(opts: { rows: number; initialLines: number; cursorY: number; y
           if (m.isDisposed) continue;
           if (m.line >= start) m.line += items.length;
         }
+        enforceMaxLength();
       }
     },
-    push(item: { content: string }) {
+    push(item: FakeLine) {
       lineArray.push(item);
     },
     pop() {
@@ -107,7 +136,7 @@ function fakeTerm(opts: { rows: number; initialLines: number; cursorY: number; y
     set y(v: number) {
       y = v;
     },
-    getBlankLine: (_attr: unknown) => ({ content: "<blank>" }),
+    getBlankLine: (_attr: unknown) => fakeBlankLine(),
     addMarker: (line: number) => makeMarker(line),
   };
 
@@ -127,6 +156,7 @@ function fakeTerm(opts: { rows: number; initialLines: number; cursorY: number; y
     term: term as unknown as Parameters<typeof createFoldStore>[0],
     buffer,
     lineContents: () => lineArray.map((l) => l.content),
+    lineRefs: () => [...lineArray],
     markers,
     makeMarker,
     triggerResize: () => resizeListeners.forEach((fn) => fn()),
@@ -327,8 +357,9 @@ describe("FoldStore — unfold() effects", () => {
     expect(after.cursorAbs).toBe(before.cursorAbs);
   });
 
-  it("unfold falls back to no-pop when end-of-buffer was overwritten (no scrollback case)", () => {
-    // ybase=0 → pushCount=count。模拟 xterm 在折叠期间往末尾追加了用户内容
+  it("unfold removes still-blank compensation lines when later output is appended", () => {
+    // ybase=0 → pushCount=count。后续输出追加在补偿空行之后时，
+    // 仍可按引用删除那些还保持空白的补偿行，保留用户输出。
     const f = fakeTerm({ rows: 24, initialLines: 24, cursorY: 14 });
     const s = f.makeMarker(0);
     const e = f.makeMarker(12);
@@ -339,29 +370,29 @@ describe("FoldStore — unfold() effects", () => {
     const afterFold = f.snapshot();
     store.unfold(1);
     const afterUnfold = f.snapshot();
-    expect(afterUnfold.length).toBe(afterFold.length + 12);
+    expect(afterUnfold.length).toBe(afterFold.length);
+    expect(f.lineContents()).toContain("<user-output>");
   });
 
-  it("unfold partial-pops when cursor can't drop full pushCount rows", () => {
-    // rows=10, ybase=0 → pushCount=count=8。手动推大 y 模拟用户敲 Enter
+  it("unfold keeps blank compensation lines the cursor has consumed", () => {
     const f = fakeTerm({ rows: 10, initialLines: 10, cursorY: 9 });
     const s = f.makeMarker(0);
     const e = f.makeMarker(8);
     const tracker = fakeTracker([makeBlock(1, s, e)]);
     const store = createFoldStore(f.term, tracker);
     store.fold(1);
-    f.buffer.y = 8;
+    const consumed = store.getFold(1)!.pushedBlankRefs[0] as FakeLine;
+    // The cursor has moved onto the first compensation blank. It still renders
+    // blank, but it now represents real terminal output and must be preserved.
+    f.buffer.y = 2;
     const afterFold = f.snapshot();
     store.unfold(1);
     const afterUnfold = f.snapshot();
-    // pushCount=8, kMax=min(8, 10-1-8)=1 → popped=1, remaining=7
-    expect(afterUnfold.length).toBe(afterFold.length + 7);
+    expect(afterUnfold.length).toBe(afterFold.length + 1);
+    expect(f.lineRefs()).toContain(consumed);
   });
 
-  it("unfold bails out when buffer end is overwritten by user output", () => {
-    // pop 是从末尾开始；末尾就是非 blank 时，第一次 pop 就 push-back + break，
-    // 一个都不 pop。这是 unfold 的"安全 pop"契约：宁可让 lines 临时膨胀，
-    // 也不能把用户写过的内容当 blank 给吞了。
+  it("unfold keeps a compensation line that was replaced by user output", () => {
     const f = fakeTerm({ rows: 24, initialLines: 24, cursorY: 14 });
     const s = f.makeMarker(0);
     const e = f.makeMarker(4);
@@ -374,8 +405,24 @@ describe("FoldStore — unfold() effects", () => {
     const afterFold = f.snapshot();
     store.unfold(1);
     const afterUnfold = f.snapshot();
-    // splice 塞回 4 行 saved；pop 一次失败、popped=0；净 +4
-    expect(afterUnfold.length).toBe(afterFold.length + 4);
+    expect(afterUnfold.length).toBe(afterFold.length + 1);
+    expect(f.lineContents()).toContain("<user-output>");
+  });
+
+  it("unfold keeps a compensation line that was reused for user output", () => {
+    const f = fakeTerm({ rows: 24, initialLines: 24, cursorY: 14 });
+    const s = f.makeMarker(0);
+    const e = f.makeMarker(4);
+    const tracker = fakeTracker([makeBlock(1, s, e)]);
+    const store = createFoldStore(f.term, tracker);
+    store.fold(1); // count=4, push 4 blanks
+    const reused = store.getFold(1)!.pushedBlankRefs[3] as FakeLine;
+    reused.content = "<user-output>";
+    const afterFold = f.snapshot();
+    store.unfold(1);
+    const afterUnfold = f.snapshot();
+    expect(afterUnfold.length).toBe(afterFold.length + 1);
+    expect(f.lineContents()).toContain("<user-output>");
   });
 
   it("unfold preserves cursor content position", () => {
@@ -427,6 +474,24 @@ describe("FoldStore — unfold() effects", () => {
     expect(store.unfold(1)).toBe(false);
     expect(store.isFolded(1)).toBe(false);
   });
+
+  it("unfold drops fold record if insert trimming disposes block.start", () => {
+    const f = fakeTerm({ rows: 5, initialLines: 5, cursorY: 4, maxLength: 5 });
+    const s = f.makeMarker(0);
+    const e = f.makeMarker(2);
+    const block = makeBlock(1, s, e);
+    const tracker = fakeTracker([block]);
+    const store = createFoldStore(f.term, tracker);
+
+    store.fold(1);
+    const markerCountAfterFold = f.markers.length;
+
+    expect(store.unfold(1)).toBe(false);
+    expect(s.isDisposed).toBe(true);
+    expect(store.isFolded(1)).toBe(false);
+    expect(f.markers.length).toBe(markerCountAfterFold);
+    expect(block.end?.isDisposed).toBe(true);
+  });
 });
 
 describe("FoldStore — multiple folds", () => {
@@ -463,6 +528,26 @@ describe("FoldStore — multiple folds", () => {
     store.unfold(2);
     expect(store.isFolded(1)).toBe(true);
     expect(store.isFolded(2)).toBe(false);
+  });
+
+  it("unfolds multiple folds in non-LIFO order without leaking compensation blanks", () => {
+    const f = fakeTerm({ rows: 24, initialLines: 24, cursorY: 19 });
+    const s1 = f.makeMarker(0);
+    const e1 = f.makeMarker(5);
+    const s2 = f.makeMarker(6);
+    const e2 = f.makeMarker(12);
+    const tracker = fakeTracker([makeBlock(1, s1, e1), makeBlock(2, s2, e2)]);
+    const store = createFoldStore(f.term, tracker);
+    const before = f.snapshot();
+    const beforeLines = f.lineContents();
+
+    store.fold(1);
+    store.fold(2);
+    store.unfold(1);
+    store.unfold(2);
+
+    expect(f.snapshot()).toEqual(before);
+    expect(f.lineContents()).toEqual(beforeLines);
   });
 });
 
