@@ -18,6 +18,8 @@
     import {createCommandBlockTracker, type CommandBlock, type CommandBlockTracker} from "../terminal/command-blocks.ts";
     import {readViewportSnapshot, readViewportText} from "../terminal/viewport-snapshot.ts";
     import {createFoldStore, type FoldStore} from "../terminal/folds.ts";
+    import {createPaintScheduler, type PaintScheduler} from "../terminal/paint-scheduler.ts";
+    import {createTerminalWriteBatcher, type TerminalWriteBatcher} from "../terminal/write-batcher.ts";
     import {extractBlocksText} from "../terminal/block-content.ts";
     import {setupTouchScroll} from "../terminal/touch-scroll.ts";
     import {renderBlocksToBlob} from "../terminal/block-to-image.ts";
@@ -95,6 +97,7 @@
         promptText: string,
         opts: { echo: boolean; onSubmit: (value: string) => void; onCancel: () => void },
     ): IDisposable {
+        writeBatcher?.flush();
         terminal.write(`\r\n${promptText}`);
 
         let buffer = "";
@@ -171,8 +174,19 @@
     // block list change. The $derived below recomputes svg rects from it.
     let blockTracker: CommandBlockTracker | undefined;
     let foldStore: FoldStore | undefined;
+    let paintScheduler: PaintScheduler | undefined;
+    let writeBatcher: TerminalWriteBatcher | undefined;
     let paintTick = $state(0);
     let isAltBuffer = $state(false);
+
+    function schedulePaintTick() {
+        paintScheduler?.schedule();
+    }
+
+    function writeRawOutput(raw: Uint8Array) {
+        if (writeBatcher) writeBatcher.write(raw);
+        else terminal.write(raw);
+    }
 
     // 右键菜单状态。null = 不显示。
     type CtxMenu = { x: number; y: number; items: MenuItem[] };
@@ -729,9 +743,10 @@
             }
             // Write the raw bytes untouched — keyword highlighting is a decoration
             // layer over the parsed grid (HighlightDecorator), not a byte rewrite.
-            terminal.write(raw);
+            writeRawOutput(raw);
         }));
         unlisteners.push(await listen(`${closeEvent}:${sid}`, () => {
+            writeBatcher?.flush();
             disconnected = true;
             // Serial: the port just died; free its backend handle NOW so the
             // exclusive OS port is released. Otherwise the reconnect below
@@ -833,7 +848,7 @@
         } else {
             // SSH: listen on tabId FIRST for connection logs + auth prompts
             const logUn = await listen<number[]>(`ssh:data:${tabId}`, (ev) => {
-                terminal.write(new Uint8Array(ev.payload));
+                writeRawOutput(new Uint8Array(ev.payload));
             });
             const authUn = await listen<AuthPromptData>(`ssh:auth_prompt:${tabId}`, (ev) => {
                 authPrompt = ev.payload;
@@ -860,6 +875,7 @@
                 logUn(); authUn(); passUn(); hkUn();
                 passphraseInputDisposable?.dispose(); passphraseInputDisposable = undefined;
                 hostKeyInputDisposable?.dispose(); hostKeyInputDisposable = undefined;
+                writeBatcher?.flush();
                 terminal.write(`\x1b[31mConnection failed: ${e}\x1b[0m\r\n`);
                 terminal.write("\x1b[90mPress any key to reconnect.\x1b[0m\r\n");
                 disconnected = true;
@@ -1184,6 +1200,9 @@
         }));
         terminal.open(containerEl);
         terminal.unicode.activeVersion = "11";
+        writeBatcher = createTerminalWriteBatcher({
+            write: (data) => terminal.write(data),
+        });
         // Keyword highlighting lives here: a decoration layer over the parsed
         // cell grid. The reactive $effect above feeds it the compiled rules.
         highlightDecorator = new HighlightDecorator(terminal);
@@ -1303,9 +1322,13 @@
         // Fold store — splice-based fold/unfold with auto-cleanup on resize and
         // scrollback trim. See folds.ts for the invariant analysis.
         foldStore = createFoldStore(terminal, blockTracker);
+        paintScheduler = createPaintScheduler({
+            shouldPaint: () => app.commandBlockBar() && !isAltBuffer,
+            paint: () => { paintTick++; },
+        });
         foldStore.onChange(() => paintTick++);
-        terminal.onScroll(() => paintTick++);
-        terminal.onRender(() => paintTick++);
+        terminal.onScroll(schedulePaintTick);
+        terminal.onRender(schedulePaintTick);
         terminal.buffer.onBufferChange((buf) => {
             isAltBuffer = buf.type === "alternate";
             paintTick++;
@@ -1370,7 +1393,7 @@
 
     // When the block-bar toggle flips, xterm's left padding changes — it
     // needs to refit so columns recompute. The refit triggers xterm's own
-    // render, which fires onRender → paintTick++, so the overlay resyncs
+    // render, whose listener schedules a paint tick, so the overlay resyncs
     // without us writing paintTick here (writing it here would make this
     // effect self-dependent via `++`, causing an update loop).
     $effect(() => {
@@ -1432,6 +1455,8 @@
         resizeObs?.disconnect();
         mobileKeyboardCleanup?.();
         mobileTouchScrollCleanup?.();
+        writeBatcher?.dispose();
+        paintScheduler?.dispose();
         foldStore?.dispose();
         blockTracker?.dispose();
         app.unregisterTerminalWriter();
