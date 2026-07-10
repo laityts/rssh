@@ -335,6 +335,7 @@ fn locale_label(locale: &str) -> &'static str {
 #[allow(clippy::too_many_arguments)]
 pub async fn ai_session_start(
     app: AppHandle,
+    window: tauri::Window,
     state: State<'_, AppState>,
     tab_id: String,
     target: AiTarget,
@@ -347,6 +348,7 @@ pub async fn ai_session_start(
     ai_session_start_impl(
         &state,
         crate::emitter::Host::Tauri(app),
+        crate::state::SessionOwner::Window(window.label().to_owned()),
         tab_id,
         target,
         skill,
@@ -363,6 +365,7 @@ pub async fn ai_session_start(
 pub async fn ai_session_start_impl(
     state: &AppState,
     host: crate::emitter::Host,
+    owner: crate::state::SessionOwner,
     tab_id: String,
     target: AiTarget,
     skill: String,
@@ -371,6 +374,8 @@ pub async fn ai_session_start_impl(
     locale: Option<String>,
     resume: Option<String>,
 ) -> AppResult<AiSessionInfo> {
+    let owner_reservation =
+        crate::commands::lifecycle::reserve_ai_owner(state, tab_id.clone(), owner)?;
     {
         let g = locked(&state.ai_sessions)?;
         // 一个 tab 至多一个 actor。前端 ensureSession 已经做了"有 session 就复用"的判断，
@@ -548,24 +553,7 @@ pub async fn ai_session_start_impl(
     // 从未运行过、不会 emit `ai:session_ended:<tab_id>` 污染赢家的事件流。
     let pending = session::start(cfg, host)?;
     let info = AiSessionInfo::from(pending.info());
-    {
-        let mut g = locked(&state.ai_sessions)?;
-        if g.contains_key(&tab_id) {
-            return Err(AppError::other(
-                "session_already_exists",
-                json!({ "tab_id": tab_id }),
-            ));
-        }
-        // Same-lock-as-insert recheck closes the resume race the early check
-        // can't (two resumes of one conversation passing it concurrently).
-        // Fresh sessions carry a new uuid, so the scan is a no-op for them.
-        if g.values()
-            .any(|s| s.conversation_id == info.conversation_id)
-        {
-            return Err(AppError::other("conversation_in_use", json!({})));
-        }
-        g.insert(tab_id, pending.launch());
-    }
+    owner_reservation.activate(pending.launch())?;
     // Create the conversation row only for NEW conversations, and only after
     // winning the slot — a racing loser must not litter the picker with an
     // empty row. Resume must NOT create: its row already exists, and an
@@ -645,12 +633,16 @@ pub async fn ai_command_reject(
 
 /// 销毁 actor。前端在 tab close 时调（panel close 只隐藏 UI，不调这个）。
 #[tauri::command]
-pub async fn ai_session_stop(state: State<'_, AppState>, tab_id: String) -> AppResult<()> {
-    let session = locked(&state.ai_sessions)?
-        .remove(&tab_id)
-        .ok_or_else(|| AppError::not_found("ai_session_not_found", json!({})))?;
-    let _ = session.action_tx.send(UserAction::Stop);
-    Ok(())
+pub async fn ai_session_stop(
+    window: tauri::Window,
+    state: State<'_, AppState>,
+    tab_id: String,
+) -> AppResult<()> {
+    crate::commands::lifecycle::close_ai_session(
+        &state,
+        &tab_id,
+        &crate::state::SessionOwner::Window(window.label().to_owned()),
+    )
 }
 
 /// 清空 actor 的 history（保留 audit log）。

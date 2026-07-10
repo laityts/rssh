@@ -1,8 +1,8 @@
 use tauri::{AppHandle, Emitter, State};
 
 use crate::error::{locked, AppError, AppResult};
-use crate::models::ConnectorSpec;
-use crate::state::AppState;
+use crate::models::{ConnectorSpec, DynamicDiscoveryPlatform};
+use crate::state::{AppState, SessionKind, SessionOwner};
 use crate::terminal::pty;
 
 #[tauri::command]
@@ -12,8 +12,16 @@ pub fn pty_spawn(
     state: State<'_, AppState>,
     cols: u16,
     rows: u16,
+    session_id: Option<String>,
 ) -> AppResult<String> {
+    let session_id = crate::commands::lifecycle::resolve_session_id(session_id)?;
     let shell = crate::db::settings::get(&state.db, "local_shell")?.filter(|s| !s.is_empty());
+    let reservation = crate::commands::lifecycle::reserve_resource(
+        &state,
+        &session_id,
+        SessionKind::Pty,
+        SessionOwner::Window(window.label().to_owned()),
+    )?;
     // Turn transport-agnostic PTY output into Tauri events. The headless ws
     // server builds a different sink over the same `pty::spawn`.
     let sink: pty::PtySink = std::sync::Arc::new(move |id: &str, out: pty::PtyOut| match out {
@@ -24,13 +32,12 @@ pub fn pty_spawn(
             let _ = app.emit(&format!("pty:close:{id}"), ());
         }
     });
-    let (id, handle) = pty::spawn(cols, rows, sink, shell)?;
-    locked(&state.pty_sessions)?.insert(id.clone(), handle);
-    crate::commands::lifecycle::register_window_session(&state, window.label(), &id);
+    let (id, handle) = pty::spawn(session_id, cols, rows, sink, shell)?;
+    reservation.activate_returned(&id, crate::commands::lifecycle::ReadySession::Pty(handle))?;
     Ok(id)
 }
 
-fn connector_command(spec: ConnectorSpec) -> AppResult<(String, Vec<String>)> {
+fn connector_command(spec: ConnectorSpec) -> AppResult<(DynamicDiscoveryPlatform, Vec<String>)> {
     match spec {
         ConnectorSpec::DockerExec {
             context,
@@ -48,7 +55,7 @@ fn connector_command(spec: ConnectorSpec) -> AppResult<(String, Vec<String>)> {
                 ));
             }
             Ok((
-                "docker".into(),
+                DynamicDiscoveryPlatform::Docker,
                 vec![
                     "--context".into(),
                     context,
@@ -91,7 +98,7 @@ fn connector_command(spec: ConnectorSpec) -> AppResult<(String, Vec<String>)> {
             }
             args.push("--".into());
             args.push(shell);
-            Ok(("kubectl".into(), args))
+            Ok((DynamicDiscoveryPlatform::K8s, args))
         }
     }
 }
@@ -104,7 +111,17 @@ pub fn pty_spawn_connector(
     cols: u16,
     rows: u16,
     spec: ConnectorSpec,
+    session_id: Option<String>,
 ) -> AppResult<String> {
+    let session_id = crate::commands::lifecycle::resolve_session_id(session_id)?;
+    let (platform, args) = connector_command(spec)?;
+    let program = crate::commands::discovery::resolve_dynamic_discovery_program(platform)?;
+    let reservation = crate::commands::lifecycle::reserve_resource(
+        &state,
+        &session_id,
+        SessionKind::Pty,
+        SessionOwner::Window(window.label().to_owned()),
+    )?;
     let sink: pty::PtySink = std::sync::Arc::new(move |id: &str, out: pty::PtyOut| match out {
         pty::PtyOut::Data(b) => {
             let _ = app.emit(&format!("pty:data:{id}"), b);
@@ -113,10 +130,16 @@ pub fn pty_spawn_connector(
             let _ = app.emit(&format!("pty:close:{id}"), ());
         }
     });
-    let (program, args) = connector_command(spec)?;
-    let (id, handle) = pty::spawn_command(cols, rows, sink, program, args)?;
-    locked(&state.pty_sessions)?.insert(id.clone(), handle);
-    crate::commands::lifecycle::register_window_session(&state, window.label(), &id);
+    let (id, handle) = pty::spawn_command(
+        session_id,
+        cols,
+        rows,
+        sink,
+        program.executable,
+        program.search_path,
+        args,
+    )?;
+    reservation.activate_returned(&id, crate::commands::lifecycle::ReadySession::Pty(handle))?;
     Ok(id)
 }
 
@@ -161,8 +184,15 @@ pub fn pty_resize(
 }
 
 #[tauri::command]
-pub fn pty_close(state: State<'_, AppState>, session_id: String) -> AppResult<()> {
-    crate::commands::lifecycle::unregister_window_session(&state, &session_id);
-    locked(&state.pty_sessions)?.remove(&session_id);
-    Ok(())
+pub fn pty_close(
+    window: tauri::Window,
+    state: State<'_, AppState>,
+    session_id: String,
+) -> AppResult<()> {
+    crate::commands::lifecycle::close_resource(
+        &state,
+        &session_id,
+        SessionKind::Pty,
+        &SessionOwner::Window(window.label().to_owned()),
+    )
 }

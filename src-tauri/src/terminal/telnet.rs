@@ -28,6 +28,9 @@ use crate::error::{locked, AppError, AppResult};
 /// `telnet:data:<id>` / `telnet:close:<id>`.
 pub enum TelnetOut {
     Data(Vec<u8>),
+    /// Whether the peer now owns echoing. The frontend uses this to switch
+    /// automatic local echo without guessing from profile defaults.
+    RemoteEcho(bool),
     Close,
 }
 
@@ -87,11 +90,15 @@ enum NState {
     SbIac,
 }
 
-/// Pure telnet option state machine. Feed inbound bytes with [`push`]; get back
-/// (terminal data, protocol replies). Option state is remembered so repeated
-/// WILL/DO from the server never re-triggers a reply — the classic negotiation
-/// loop is structurally impossible (we only answer state *changes*, and we
-/// never initiate).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NegotiationEvent {
+    RemoteEcho(bool),
+}
+
+/// Pure telnet option state machine. Accepted options remember YES so repeated
+/// WILL/DO do not re-trigger a reply. Unsupported requests are refused every
+/// time while remaining in RFC 1143 NO; this client never initiates options, so
+/// the WANTNO/WANTYES queue states are unnecessary.
 pub struct Negotiator {
     state: NState,
     sb_opt: u8,
@@ -100,6 +107,10 @@ pub struct Negotiator {
     remote_on: [bool; 256],
     /// local_on[opt]: server said DO opt and we agreed (WILL sent).
     local_on: [bool; 256],
+    /// Non-BINARY NVT decoding needs one byte of look-behind: CR NUL is a
+    /// literal carriage return and CR LF is a newline, even when a socket read
+    /// splits the pair.
+    remote_pending_cr: bool,
     cols: u16,
     rows: u16,
 }
@@ -112,26 +123,35 @@ impl Negotiator {
             sb_buf: Vec::new(),
             remote_on: [false; 256],
             local_on: [false; 256],
+            remote_pending_cr: false,
             // Standard NVT assumption until the frontend's first fit/resize.
             cols: 80,
             rows: 24,
         }
     }
 
-    /// Process inbound bytes. Returns `(data, reply)`: `data` goes to the
-    /// terminal, `reply` goes back down the socket verbatim.
-    pub fn push(&mut self, input: &[u8]) -> (Vec<u8>, Vec<u8>) {
+    fn push_with_events(&mut self, input: &[u8]) -> (Vec<u8>, Vec<u8>, Vec<NegotiationEvent>) {
         let mut data = Vec::with_capacity(input.len());
         let mut reply = Vec::new();
+        let mut events = Vec::new();
         for &b in input {
             match self.state {
                 NState::Data => match b {
-                    IAC => self.state = NState::Iac,
-                    _ => data.push(b),
+                    IAC => {
+                        // A Telnet command is a processing boundary. In
+                        // particular, a WILL BINARY here changes how the next
+                        // data byte is interpreted, so it cannot remain the
+                        // partner of an earlier NVT CR.
+                        if std::mem::take(&mut self.remote_pending_cr) {
+                            data.push(b'\r');
+                        }
+                        self.state = NState::Iac;
+                    }
+                    _ => self.push_data_byte(b, &mut data),
                 },
                 NState::Iac => match b {
                     IAC => {
-                        data.push(IAC); // escaped literal 0xFF
+                        self.push_data_byte(IAC, &mut data); // escaped literal 0xFF
                         self.state = NState::Data;
                     }
                     WILL | WONT | DO | DONT => self.state = NState::Verb(b),
@@ -140,7 +160,7 @@ impl Negotiator {
                     _ => self.state = NState::Data,
                 },
                 NState::Verb(verb) => {
-                    self.on_verb(verb, b, &mut reply);
+                    self.on_verb(verb, b, &mut reply, &mut events);
                     self.state = NState::Data;
                 }
                 NState::SbOpt => {
@@ -174,10 +194,72 @@ impl Negotiator {
                 },
             }
         }
-        (data, reply)
+        (data, reply, events)
     }
 
-    fn on_verb(&mut self, verb: u8, opt: u8, reply: &mut Vec<u8>) {
+    fn push_data_byte(&mut self, byte: u8, data: &mut Vec<u8>) {
+        if self.remote_pending_cr {
+            self.remote_pending_cr = false;
+            match byte {
+                0 => data.push(b'\r'),
+                b'\n' => data.extend_from_slice(b"\r\n"),
+                other => {
+                    data.push(b'\r');
+                    if !self.remote_on[OPT_BINARY as usize] && other == b'\r' {
+                        self.remote_pending_cr = true;
+                    } else {
+                        data.push(other);
+                    }
+                }
+            }
+            return;
+        }
+
+        if !self.remote_on[OPT_BINARY as usize] && byte == b'\r' {
+            self.remote_pending_cr = true;
+        } else {
+            data.push(byte);
+        }
+    }
+
+    fn finish_inbound(&mut self) -> Vec<u8> {
+        if std::mem::take(&mut self.remote_pending_cr) {
+            vec![b'\r']
+        } else {
+            Vec::new()
+        }
+    }
+
+    fn encode_outbound(&self, data: &[u8]) -> Vec<u8> {
+        if self.local_on[OPT_BINARY as usize] {
+            return escape_iac(data);
+        }
+
+        let mut nvt = Vec::with_capacity(data.len());
+        let mut i = 0;
+        while i < data.len() {
+            let byte = data[i];
+            nvt.push(byte);
+            if byte == b'\r' {
+                if data.get(i + 1) == Some(&b'\n') {
+                    nvt.push(b'\n');
+                    i += 1;
+                } else {
+                    nvt.push(0);
+                }
+            }
+            i += 1;
+        }
+        escape_iac(&nvt)
+    }
+
+    fn on_verb(
+        &mut self,
+        verb: u8,
+        opt: u8,
+        reply: &mut Vec<u8>,
+        events: &mut Vec<NegotiationEvent>,
+    ) {
         let i = opt as usize;
         match verb {
             WILL => {
@@ -185,8 +267,14 @@ impl Negotiator {
                     if !self.remote_on[i] {
                         self.remote_on[i] = true;
                         reply.extend([IAC, DO, opt]);
+                        if opt == OPT_ECHO {
+                            events.push(NegotiationEvent::RemoteEcho(true));
+                        }
                     }
                 } else {
+                    // We remain in RFC 1143 NO. A future WILL is a new request
+                    // and must be refused again; "Refused until WONT" is not a
+                    // protocol state.
                     reply.extend([IAC, DONT, opt]);
                 }
             }
@@ -195,9 +283,12 @@ impl Negotiator {
                 // an option that was never on needs no answer (RFC 854 forbids
                 // acknowledging a non-change — that's the loop trap).
                 if self.remote_on[i] {
-                    self.remote_on[i] = false;
                     reply.extend([IAC, DONT, opt]);
+                    if opt == OPT_ECHO {
+                        events.push(NegotiationEvent::RemoteEcho(false));
+                    }
                 }
+                self.remote_on[i] = false;
             }
             DO => {
                 if local_ok(opt) {
@@ -216,9 +307,9 @@ impl Negotiator {
             }
             DONT => {
                 if self.local_on[i] {
-                    self.local_on[i] = false;
                     reply.extend([IAC, WONT, opt]);
                 }
+                self.local_on[i] = false;
             }
             _ => unreachable!("state machine only enters Verb for the 4 verbs"),
         }
@@ -227,7 +318,10 @@ impl Negotiator {
     fn on_subneg(&mut self, reply: &mut Vec<u8>) {
         // TTYPE SEND → IS "xterm-256color". The only subnegotiation a server
         // sends that we answer; everything else (incl. stray NAWS) is ignored.
-        if self.sb_opt == OPT_TTYPE && self.sb_buf.as_slice() == [TTYPE_SEND] {
+        if self.local_on[OPT_TTYPE as usize]
+            && self.sb_opt == OPT_TTYPE
+            && self.sb_buf.as_slice() == [TTYPE_SEND]
+        {
             reply.extend([IAC, SB, OPT_TTYPE, TTYPE_IS]);
             reply.extend_from_slice(TERM_TYPE);
             reply.extend([IAC, SE]);
@@ -258,10 +352,9 @@ fn naws_subneg(cols: u16, rows: u16) -> Vec<u8> {
     v
 }
 
-/// Escape outbound user data: 0xFF must go on the wire as IAC IAC. Line-ending
-/// discipline (CR vs CRLF) is NOT handled here — it's a frontend transform,
-/// same as serial (the telnet profile's input_newline defaults to crlf, which
-/// is already NVT-conformant end-of-line).
+/// Escape outbound user data: 0xFF must go on the wire as IAC IAC. NVT CR
+/// mapping is applied separately according to the negotiated BINARY state;
+/// this helper is also used for already-binary payloads.
 fn escape_iac(data: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(data.len());
     for &b in data {
@@ -298,6 +391,9 @@ pub struct TelnetHandle {
     _guard: Arc<CloseGuard>,
     /// "host:port" as the user typed it — AI session scope + labels.
     peer: Arc<str>,
+    /// Profile-owned line ending used by command-oriented writers such as AI.
+    /// Raw terminal writes still pass bytes through unchanged.
+    input_newline: Arc<[u8]>,
 }
 
 fn telnet_op_err(e: impl std::fmt::Display) -> AppError {
@@ -309,8 +405,13 @@ fn telnet_op_err(e: impl std::fmt::Display) -> AppError {
 
 impl TelnetHandle {
     pub fn write(&self, data: &[u8]) -> AppResult<()> {
+        // Same neg -> writer lock order as resize and the reader thread. The
+        // negotiated BINARY state and the bytes encoded from it are therefore
+        // one observation: a concurrent DO/DONT cannot overtake this write.
+        let neg = locked(&self.neg)?;
+        let encoded = neg.encode_outbound(data);
         locked(&self.writer)?
-            .write_all(&escape_iac(data))
+            .write_all(&encoded)
             .map_err(telnet_op_err)
     }
 
@@ -334,6 +435,13 @@ impl TelnetHandle {
     /// "host:port" this session was opened against.
     pub fn peer(&self) -> &str {
         &self.peer
+    }
+
+    pub fn write_line(&self, text: &str) -> AppResult<()> {
+        let mut data = Vec::with_capacity(text.len() + self.input_newline.len());
+        data.extend_from_slice(text.as_bytes());
+        data.extend_from_slice(&self.input_newline);
+        self.write(&data)
     }
 }
 
@@ -375,13 +483,27 @@ fn connect(host: &str, port: u16) -> AppResult<TcpStream> {
 /// carries the caller's real terminal size (same contract as `ssh_connect`) —
 /// the server's DO NAWS usually arrives before the frontend's first fit/resize
 /// round-trip, and without the seed that reply would report the 80x24 default.
+/// `input_newline` is retained by the handle for command-oriented `write_line`.
 pub fn open(
+    session_id: String,
     host: &str,
     port: u16,
     cols: u16,
     rows: u16,
+    input_newline: &str,
     sink: TelnetSink,
 ) -> AppResult<(String, TelnetHandle)> {
+    let input_newline: Arc<[u8]> = match input_newline {
+        "cr" => Arc::from(&b"\r"[..]),
+        "lf" => Arc::from(&b"\n"[..]),
+        "crlf" => Arc::from(&b"\r\n"[..]),
+        _ => {
+            return Err(AppError::config(
+                "telnet_profile_invalid",
+                serde_json::json!({ "field": "input_newline" }),
+            ));
+        }
+    };
     let peer = format!("{host}:{port}");
     let stream = connect(host, port)?;
     // Interactive session: a keystroke per packet beats Nagle batching.
@@ -411,12 +533,13 @@ pub fn open(
     // the size is simply remembered for the activation reply.
     let _ = negotiator.set_size(cols, rows);
 
-    let id = uuid::Uuid::new_v4().to_string();
+    let id = session_id;
     let handle = TelnetHandle {
         writer: Arc::new(Mutex::new(stream)),
         neg: Arc::new(Mutex::new(negotiator)),
         _guard: Arc::new(CloseGuard { closed }),
         peer: Arc::from(peer.as_str()),
+        input_newline,
     };
 
     // Reader thread: socket RX → negotiator → (replies back down the socket,
@@ -440,12 +563,12 @@ pub fn open(
                     // order as resize): a concurrent resize() can't interleave
                     // its NAWS report ahead of the activation reply it belongs
                     // after. Same order both sides = no deadlock.
-                    let data = {
+                    let (data, events) = {
                         let mut neg = match neg.lock() {
                             Ok(g) => g,
                             Err(_) => break, // poisoned — a peer panicked; give up
                         };
-                        let (data, reply) = neg.push(&buf[..n]);
+                        let (data, reply, events) = neg.push_with_events(&buf[..n]);
                         if !reply.is_empty() {
                             // Protocol replies are pre-formed bytes — no IAC escaping.
                             let sent = writer.lock().map(|mut w| w.write_all(&reply));
@@ -453,8 +576,15 @@ pub fn open(
                                 break;
                             }
                         }
-                        data
+                        (data, events)
                     };
+                    for event in events {
+                        match event {
+                            NegotiationEvent::RemoteEcho(enabled) => {
+                                sink(&sid, TelnetOut::RemoteEcho(enabled));
+                            }
+                        }
+                    }
                     if !data.is_empty() {
                         sink(&sid, TelnetOut::Data(data));
                     }
@@ -468,6 +598,15 @@ pub fn open(
                 Err(_) => break, // connection reset / fatal IO error
             }
         }
+        // A malformed/abrupt peer may end after a lone CR. Preserve that byte
+        // rather than silently losing terminal output at EOF.
+        let trailing = neg
+            .lock()
+            .map(|mut negotiator| negotiator.finish_inbound())
+            .unwrap_or_default();
+        if !trailing.is_empty() {
+            sink(&sid, TelnetOut::Data(trailing));
+        }
         sink(&sid, TelnetOut::Close);
     });
 
@@ -480,7 +619,26 @@ mod tests {
 
     /// Feed one inbound byte-string, expect (data, reply).
     fn push(neg: &mut Negotiator, input: &[u8]) -> (Vec<u8>, Vec<u8>) {
-        neg.push(input)
+        let (data, reply, _) = neg.push_with_events(input);
+        (data, reply)
+    }
+
+    fn open(
+        host: &str,
+        port: u16,
+        cols: u16,
+        rows: u16,
+        sink: TelnetSink,
+    ) -> AppResult<(String, TelnetHandle)> {
+        super::open(
+            uuid::Uuid::new_v4().to_string(),
+            host,
+            port,
+            cols,
+            rows,
+            "crlf",
+            sink,
+        )
     }
 
     #[test]
@@ -502,11 +660,21 @@ mod tests {
     #[test]
     fn will_echo_answered_do_once() {
         let mut n = Negotiator::new();
-        let (_, reply) = push(&mut n, &[IAC, WILL, OPT_ECHO]);
+        let (_, reply, events) = n.push_with_events(&[IAC, WILL, OPT_ECHO]);
         assert_eq!(reply, [IAC, DO, OPT_ECHO]);
+        assert_eq!(events, [NegotiationEvent::RemoteEcho(true)]);
         // Repeated WILL for an already-on option: no answer (loop prevention).
-        let (_, reply) = push(&mut n, &[IAC, WILL, OPT_ECHO]);
+        let (_, reply, events) = n.push_with_events(&[IAC, WILL, OPT_ECHO]);
         assert!(reply.is_empty());
+        assert!(events.is_empty());
+
+        let (_, reply, events) = n.push_with_events(&[IAC, WONT, OPT_ECHO]);
+        assert_eq!(reply, [IAC, DONT, OPT_ECHO]);
+        assert_eq!(events, [NegotiationEvent::RemoteEcho(false)]);
+
+        let (_, reply, events) = n.push_with_events(&[IAC, WILL, OPT_ECHO]);
+        assert_eq!(reply, [IAC, DO, OPT_ECHO]);
+        assert_eq!(events, [NegotiationEvent::RemoteEcho(true)]);
     }
 
     #[test]
@@ -522,6 +690,71 @@ mod tests {
         let mut n = Negotiator::new();
         let (_, reply) = push(&mut n, &[IAC, DO, 32]);
         assert_eq!(reply, [IAC, WONT, 32]);
+    }
+
+    #[test]
+    fn repeated_unknown_option_request_is_refused_each_time() {
+        let mut n = Negotiator::new();
+        let (_, first) = push(&mut n, &[IAC, WILL, 32]);
+        let (_, repeated) = push(&mut n, &[IAC, WILL, 32]);
+        assert_eq!(first, [IAC, DONT, 32]);
+        assert_eq!(repeated, [IAC, DONT, 32]);
+
+        let (_, first) = push(&mut n, &[IAC, DO, 33]);
+        let (_, repeated) = push(&mut n, &[IAC, DO, 33]);
+        assert_eq!(first, [IAC, WONT, 33]);
+        assert_eq!(repeated, [IAC, WONT, 33]);
+    }
+
+    #[test]
+    fn inbound_nvt_cr_mapping_survives_read_boundaries() {
+        let mut n = Negotiator::new();
+        let (data, reply) = push(&mut n, b"a\r");
+        assert_eq!(data, b"a");
+        assert!(reply.is_empty());
+
+        let (data, _) = push(&mut n, b"\0b\r");
+        assert_eq!(data, b"\rb");
+        let (data, _) = push(&mut n, b"\nc");
+        assert_eq!(data, b"\r\nc");
+    }
+
+    #[test]
+    fn inbound_iac_command_ends_pending_cr_before_binary_mode() {
+        let mut n = Negotiator::new();
+        let (data, reply) = push(&mut n, &[b'\r', IAC, WILL, OPT_BINARY, b'\0']);
+
+        assert_eq!(reply, [IAC, DO, OPT_BINARY]);
+        assert_eq!(data, b"\r\0");
+    }
+
+    #[test]
+    fn inbound_binary_mode_preserves_cr_nul() {
+        let mut n = Negotiator::new();
+        let (_, reply) = push(&mut n, &[IAC, WILL, OPT_BINARY]);
+        assert_eq!(reply, [IAC, DO, OPT_BINARY]);
+
+        let (data, _) = push(&mut n, b"\r\0");
+        assert_eq!(data, b"\r\0");
+    }
+
+    #[test]
+    fn inbound_lone_cr_is_flushed_at_eof() {
+        let mut n = Negotiator::new();
+        let (data, _) = push(&mut n, b"tail\r");
+        assert_eq!(data, b"tail");
+        assert_eq!(n.finish_inbound(), b"\r");
+        assert!(n.finish_inbound().is_empty());
+    }
+
+    #[test]
+    fn outbound_nvt_mapping_and_iac_escaping_follow_binary_state() {
+        let mut n = Negotiator::new();
+        assert_eq!(n.encode_outbound(b"a\rb\r\n\xff"), b"a\r\0b\r\n\xff\xff",);
+
+        let (_, reply) = push(&mut n, &[IAC, DO, OPT_BINARY]);
+        assert_eq!(reply, [IAC, WILL, OPT_BINARY]);
+        assert_eq!(n.encode_outbound(b"\r\0\xff"), b"\r\0\xff\xff");
     }
 
     #[test]
@@ -564,6 +797,14 @@ mod tests {
         want.extend_from_slice(b"xterm-256color");
         want.extend([IAC, SE]);
         assert_eq!(reply, want);
+    }
+
+    #[test]
+    fn ttype_send_before_activation_is_ignored() {
+        let mut n = Negotiator::new();
+        let (data, reply) = push(&mut n, &[IAC, SB, OPT_TTYPE, TTYPE_SEND, IAC, SE]);
+        assert!(data.is_empty());
+        assert!(reply.is_empty());
     }
 
     #[test]
@@ -614,7 +855,7 @@ mod tests {
     fn oversized_subneg_payload_is_capped_not_grown() {
         let mut n = Negotiator::new();
         let mut input = vec![IAC, SB, OPT_TTYPE];
-        input.extend(std::iter::repeat(b'x').take(SB_CAP * 4));
+        input.extend(std::iter::repeat_n(b'x', SB_CAP * 4));
         input.extend([IAC, SE]);
         let (data, reply) = push(&mut n, &input);
         assert!(data.is_empty());
@@ -684,13 +925,16 @@ mod tests {
 
         // Banner comes through with IAC negotiation stripped.
         let mut banner = Vec::new();
+        let mut saw_remote_echo = false;
         while banner.len() < 7 {
             match rx.recv_timeout(Duration::from_secs(5)).unwrap() {
                 TelnetOut::Data(b) => banner.extend(b),
+                TelnetOut::RemoteEcho(enabled) => saw_remote_echo = enabled,
                 TelnetOut::Close => panic!("closed before banner complete"),
             }
         }
         assert_eq!(banner, b"login: ");
+        assert!(saw_remote_echo);
 
         // Write with an embedded 0xFF — must be escaped on the wire.
         handle
@@ -706,6 +950,7 @@ mod tests {
             match rx.recv_timeout(Duration::from_secs(5)).unwrap() {
                 TelnetOut::Close => break,
                 TelnetOut::Data(_) => continue,
+                TelnetOut::RemoteEcho(_) => continue,
             }
         }
         drop(server_sock);
@@ -735,6 +980,7 @@ mod tests {
                     saw_data = true;
                 }
                 TelnetOut::Close => break,
+                TelnetOut::RemoteEcho(_) => continue,
             }
         }
         assert!(saw_data);
@@ -753,6 +999,49 @@ mod tests {
             Ok(_) => panic!("connect to a closed port unexpectedly succeeded"),
         };
         assert_eq!(err.code(), "telnet_open_failed");
+    }
+
+    #[test]
+    fn write_line_uses_profile_input_newline() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            read_exact_timeout(&mut stream, 5)
+        });
+        let sink: TelnetSink = Arc::new(|_id, _out| {});
+        let (_id, handle) = super::open(
+            uuid::Uuid::new_v4().to_string(),
+            "127.0.0.1",
+            port,
+            80,
+            24,
+            "lf",
+            sink,
+        )
+        .unwrap();
+
+        handle.write_line("show").unwrap();
+
+        assert_eq!(server.join().unwrap(), b"show\n");
+    }
+
+    #[test]
+    fn invalid_input_newline_fails_before_connect() {
+        let sink: TelnetSink = Arc::new(|_id, _out| {});
+        let err = match super::open(
+            uuid::Uuid::new_v4().to_string(),
+            "not-resolved.invalid",
+            23,
+            80,
+            24,
+            "wat",
+            sink,
+        ) {
+            Ok(_) => panic!("invalid newline unexpectedly opened a connection"),
+            Err(err) => err,
+        };
+        assert_eq!(err.code(), "telnet_profile_invalid");
     }
 
     #[test]
@@ -794,6 +1083,7 @@ mod tests {
             match rx.recv_timeout(Duration::from_secs(5)).unwrap() {
                 TelnetOut::Data(b) if b == b"k" => break,
                 TelnetOut::Data(_) => continue,
+                TelnetOut::RemoteEcho(_) => continue,
                 TelnetOut::Close => panic!("closed before negotiation marker"),
             }
         }
@@ -805,6 +1095,7 @@ mod tests {
             match rx.recv_timeout(Duration::from_secs(5)).unwrap() {
                 TelnetOut::Close => break,
                 TelnetOut::Data(_) => continue,
+                TelnetOut::RemoteEcho(_) => continue,
             }
         }
     }

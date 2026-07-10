@@ -2,7 +2,7 @@ use tauri::{AppHandle, Emitter, State};
 
 use crate::error::{locked, AppError, AppResult};
 use crate::models::SerialProfile;
-use crate::state::AppState;
+use crate::state::{AppState, SessionKind, SessionOwner};
 use crate::terminal::serial;
 
 #[tauri::command]
@@ -17,7 +17,15 @@ pub fn serial_open(
     state: State<'_, AppState>,
     port: String,
     config: serial::SerialConfig,
+    session_id: Option<String>,
 ) -> AppResult<String> {
+    let session_id = crate::commands::lifecycle::resolve_session_id(session_id)?;
+    let reservation = crate::commands::lifecycle::reserve_resource(
+        &state,
+        &session_id,
+        SessionKind::Serial,
+        SessionOwner::Window(window.label().to_owned()),
+    )?;
     // Turn transport-agnostic serial output into Tauri events. The headless ws
     // server builds a different sink over the same `serial::open`.
     let sink: serial::SerialSink =
@@ -29,9 +37,11 @@ pub fn serial_open(
                 let _ = app.emit(&format!("serial:close:{id}"), ());
             }
         });
-    let (id, handle) = serial::open(&port, config, sink)?;
-    locked(&state.serial_sessions)?.insert(id.clone(), handle);
-    crate::commands::lifecycle::register_window_session(&state, window.label(), &id);
+    let (id, handle) = serial::open(session_id, &port, config, sink)?;
+    reservation.activate_returned(
+        &id,
+        crate::commands::lifecycle::ReadySession::Serial(handle),
+    )?;
     Ok(id)
 }
 
@@ -84,10 +94,17 @@ pub fn serial_send_break(state: State<'_, AppState>, session_id: String) -> AppR
 // table maps serial's resize entry to null, so it simply never calls it.
 
 #[tauri::command]
-pub fn serial_close(state: State<'_, AppState>, session_id: String) -> AppResult<()> {
-    crate::commands::lifecycle::unregister_window_session(&state, &session_id);
-    locked(&state.serial_sessions)?.remove(&session_id);
-    Ok(())
+pub fn serial_close(
+    window: tauri::Window,
+    state: State<'_, AppState>,
+    session_id: String,
+) -> AppResult<()> {
+    crate::commands::lifecycle::close_resource(
+        &state,
+        &session_id,
+        SessionKind::Serial,
+        &SessionOwner::Window(window.label().to_owned()),
+    )
 }
 
 // ── Saved serial profiles (peer of profile/forward; SQLite-persisted CRUD) ──

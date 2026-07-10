@@ -1,7 +1,18 @@
 <script lang="ts">
-  import { onMount } from "svelte";
   import * as app from "../stores/app.svelte.ts";
-  import type { Profile, Credential, Forward, Group, SerialProfile, TelnetProfile, DynamicDiscoveredTarget, ConnectorSpec } from "../stores/app.svelte.ts";
+  import type {
+    Profile,
+    Credential,
+    Forward,
+    Group,
+    SerialProfile,
+    TelnetProfile,
+    DynamicDiscoveredTarget,
+    ConnectorSpec,
+  } from "../stores/app.svelte.ts";
+  import { errMsg } from "../i18n/index.svelte.ts";
+  import { toast } from "../stores/toast.svelte.ts";
+  import { createHomeRefresh } from "./home-refresh.ts";
 
   let profiles = $state<Profile[]>([]);
   let credentials = $state<Credential[]>([]);
@@ -11,6 +22,47 @@
   let telnetProfiles = $state<TelnetProfile[]>([]);
   let dynamicTargets = $state<DynamicDiscoveredTarget[]>([]);
   let query = $state("");
+
+  const homeRefresh = createHomeRefresh({
+    loadStatic: async () => {
+      const [
+        loadedProfiles,
+        loadedCredentials,
+        loadedForwards,
+        loadedGroups,
+        loadedSerial,
+        loadedTelnet,
+      ] = await Promise.all([
+        app.loadProfiles(),
+        app.loadCredentials(),
+        app.loadForwards(),
+        app.loadGroups(),
+        app.loadSerialProfiles(),
+        app.loadTelnetProfiles(),
+      ]);
+      return {
+        loadedProfiles,
+        loadedCredentials,
+        loadedForwards,
+        loadedGroups,
+        loadedSerial,
+        loadedTelnet,
+      };
+    },
+    loadDynamic: () => app.discoverDynamicTargets(),
+    applyStatic: (loaded) => {
+      profiles = loaded.loadedProfiles;
+      credentials = loaded.loadedCredentials;
+      forwards = loaded.loadedForwards;
+      groups = loaded.loadedGroups;
+      serialProfiles = loaded.loadedSerial;
+      telnetProfiles = loaded.loadedTelnet;
+    },
+    applyDynamic: (snapshot) => {
+      dynamicTargets = snapshot.targets;
+    },
+    onError: (error) => toast.error(errMsg(error)),
+  });
 
   // One global nav index into the flat (display-order) item list.
   let navIdx = $state(-1);
@@ -195,10 +247,13 @@
     }
   }
 
-  onMount(refresh);
-
   $effect(() => {
-    if (app.activeTabId() === "home" && !app.settingsActive()) refresh();
+    if (app.activeTabId() !== "home" || app.settingsActive()) {
+      homeRefresh.cancel();
+      return;
+    }
+    void homeRefresh.refresh();
+    return () => homeRefresh.cancel();
   });
 
   // Clear the selection whenever the filter changes — otherwise the highlight
@@ -208,20 +263,6 @@
     void query;
     navIdx = -1;
   });
-
-  async function refresh() {
-    const [p, c, f, g, s, t, d] = await Promise.all([
-      app.loadProfiles(), app.loadCredentials(), app.loadForwards(), app.loadGroups(),
-      app.loadSerialProfiles(), app.loadTelnetProfiles(), app.discoverDynamicTargets(),
-    ]);
-    profiles = p;
-    credentials = c;
-    forwards = f;
-    groups = g;
-    serialProfiles = s;
-    telnetProfiles = t;
-    dynamicTargets = d.targets;
-  }
 
   function activate(it: HomeItem) {
     it.open();
