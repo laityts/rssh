@@ -5,6 +5,7 @@
     import type {Profile, Tab, Group} from "../stores/app.svelte.ts";
     import * as app from "../stores/app.svelte.ts";
     import * as updates from "../stores/updates.svelte.ts";
+    import * as syncStatus from "../stores/sync.svelte.ts";
     import HomeScreen from "./HomeScreen.svelte";
     import TerminalPane from "./TerminalPane.svelte";
     import ForwardPane from "./ForwardPane.svelte";
@@ -39,6 +40,22 @@
     let pinned = $state(false);
     const bypassStartupReconcile = !!window.__rssh_clone || !!window.__rssh_ai_handoff;
     let resourcePanesAllowed = $state(bypassStartupReconcile);
+    let navigationLoad = 0;
+
+    async function refreshNavigationData() {
+        const current = ++navigationLoad;
+        try {
+            const [nextProfiles, nextGroups] = await Promise.all([
+                app.loadProfiles(),
+                app.loadGroups(),
+            ]);
+            if (current !== navigationLoad) return;
+            profiles = nextProfiles;
+            groups = nextGroups;
+        } catch (error) {
+            console.warn("[sync] navigation data refresh failed:", error);
+        }
+    }
 
     function togglePin() {
         pinned = !pinned;
@@ -172,8 +189,6 @@
     onMount(() => {
         const startup = new AbortController();
         keymap.init();
-        app.loadProfiles().then(p => profiles = p);
-        app.loadGroups().then(g => groups = g);
         // Crash recovery must settle before any pane can create a replacement
         // backend resource. Otherwise reconcile([]) can race that new session.
         //
@@ -208,6 +223,11 @@
             detachKeydown();
             detachKeyup();
         };
+    });
+
+    $effect(() => {
+        syncStatus.configurationRevision();
+        void refreshNavigationData();
     });
 
     /* Consume window.__rssh_ai_handoff injected by analyze_locally tool.
@@ -290,8 +310,7 @@
         // Desktop no longer opens a drawer; refresh pinned profiles when the
         // touch drawer opens OR when Ctrl+Tab cycling begins.
         if (drawerOpen || tabCycling) {
-            app.loadProfiles().then(p => profiles = p);
-            app.loadGroups().then(g => groups = g);
+            void refreshNavigationData();
         }
     });
 
@@ -978,7 +997,7 @@
                         focused={isFocusedItem(item)}
                         pinnedState={pinned}
                         badge={item.kind === "downloads" ? xferBadge : null}
-                        redDot={item.kind === "settings" && updates.hasUpdate()}
+                        redDot={item.kind === "settings" && (updates.hasUpdate() || syncStatus.anyVersionDifference())}
                         onActivate={(e) => activateNavItem(item, e)}
                     />
                 {/each}
@@ -994,7 +1013,7 @@
             dragTabId={dragTabId}
             dropTabId={dropTabId}
             xferBadge={xferBadge}
-            settingsRedDot={updates.hasUpdate()}
+            settingsRedDot={updates.hasUpdate() || syncStatus.anyVersionDifference()}
             isActiveItem={isActiveItem}
             isFocusedItem={isFocusedItem}
             groupColorOf={tabGroupColor}

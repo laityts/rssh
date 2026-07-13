@@ -5,6 +5,7 @@
   import WelcomeScreen from "./lib/components/WelcomeScreen.svelte";
   import { loadProfiles, loadForwards } from "./lib/stores/app.svelte.ts";
   import * as updates from "./lib/stores/updates.svelte.ts";
+  import * as sync from "./lib/stores/sync.svelte.ts";
   import * as ai from "./lib/ai/store.svelte.ts";
 
   // First-launch auto-show: when there are no profiles and no forwards,
@@ -16,6 +17,14 @@
   const DISMISSED_KEY = "rssh.welcome.dismissed";
 
   let showWelcome = $state(false);
+
+  $effect(() => {
+    const revision = sync.configurationRevision();
+    if (revision === 0) return;
+    void ai.loadSettings().catch((e) =>
+      console.warn("[sync] AI settings refresh failed:", e),
+    );
+  });
 
   onMount(async () => {
     // 预热 AI 设置：色条"发送到 AI"等入口靠 ai.settings()?.has_api_key 同步判断是否
@@ -34,6 +43,7 @@
     // they're transient and the main window already owns the timer.
     if (!window.__rssh_clone && !window.__rssh_ai_handoff) {
       updates.startBackgroundChecks();
+      sync.startBackgroundChecks();
     }
 
     // localStorage / Tauri may not be available in non-app hosts

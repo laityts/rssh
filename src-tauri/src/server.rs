@@ -359,6 +359,15 @@ fn dispatch(
             };
             ok(r)
         }
+        "set_sync_auto_pull" => ok(crate::commands::sync::set_sync_auto_pull_impl(
+            state,
+            arg(&args, "provider")?,
+            arg(&args, "enabled")?,
+            arg(&args, "password")?,
+        )),
+        "get_sync_auto_pull_status" => {
+            ok(crate::commands::sync::get_sync_auto_pull_status_impl(state))
+        }
         "list_highlights" => ok(crate::db::highlight::list(&state.db)),
         "add_highlight" => ok(crate::db::highlight::insert(
             &state.db,
@@ -1192,6 +1201,11 @@ async fn dispatch_async(
         "webdav_pull" => {
             ok(crate::commands::sync::webdav_pull_impl(state, arg(&args, "password")?).await)
         }
+        "sync_check" => ok(crate::commands::sync::sync_check_impl(state).await),
+        "sync_refresh_local_metadata" => {
+            ok(crate::commands::sync::sync_refresh_local_metadata_impl(state).await)
+        }
+        "sync_check_remotes" => ok(crate::commands::sync::sync_check_remotes_impl(state).await),
 
         // ---- port forwarding: start (stop is sync, in dispatch) ----
         "forward_start" => ok(crate::commands::forward::forward_start_impl(
