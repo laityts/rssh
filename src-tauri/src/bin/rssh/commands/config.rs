@@ -99,6 +99,49 @@ fn config_import(conn: &CliCtx, file: &str) -> AppResult<()> {
     Ok(())
 }
 
+fn remote_runtime() -> tokio::runtime::Runtime {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap_or_else(|e| die(format!("Tokio runtime: {e}")))
+}
+
+fn push_remote_backup(
+    conn: &CliCtx,
+    remote: &dyn rssh_lib::sync::remote::RemoteBackup,
+) -> AppResult<()> {
+    let secrets = conn.secret_store();
+    let mut prepared =
+        rssh_lib::sync::remote::prepare_backup(conn, secrets.as_ref(), &conn.data_dir)?;
+    let password = read_password("Encryption password: ");
+    let encrypted = rssh_lib::crypto::encrypt(&prepared.json, &password)?;
+    prepared.json.clear();
+
+    remote_runtime().block_on(rssh_lib::sync::remote::publish(
+        remote,
+        &encrypted,
+        &prepared.metadata,
+    ))?;
+    Ok(())
+}
+
+fn pull_remote_backup(
+    conn: &CliCtx,
+    remote: &dyn rssh_lib::sync::remote::RemoteBackup,
+) -> AppResult<()> {
+    let fetched = remote_runtime().block_on(rssh_lib::sync::remote::fetch(remote))?;
+    let password = read_password("Decryption password: ");
+    let secrets = conn.secret_store();
+    rssh_lib::sync::remote::apply_fetched_backup(
+        conn,
+        secrets.as_ref(),
+        &conn.data_dir,
+        fetched,
+        &password,
+    )?;
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // GitHub sync
 // ---------------------------------------------------------------------------
@@ -145,48 +188,16 @@ fn config_github_set(conn: &CliCtx) -> AppResult<()> {
 
 fn config_github_push(conn: &CliCtx) -> AppResult<()> {
     let (token, repo, branch) = read_github_settings(conn)?;
-
-    // push 路径：跟 GUI push 用同一个 build_payload —— 尊重所有同步开关 + group 过滤
-    // + save_to_remote scrub + AI-key 闸门。GUI 里关掉的类别，CLI 也不会漏到同一 repo。
-    let ss: &dyn SecretStore = conn.secret_store().as_ref();
-    let prefs = rssh_lib::sync::config::read_sync_prefs(conn)?;
-    let payload = rssh_lib::sync::config::build_payload(
-        conn,
-        ss,
-        &conn.data_dir,
-        &rssh_lib::sync::config::ExportMode::RemotePush(prefs),
-    )?;
-    let mut json_data = serde_json::to_string_pretty(&payload)
-        .unwrap_or_else(|e| die(format!("Serialization failed: {e}")));
-
-    let pw = read_password("Encryption password: ");
-    let encrypted = rssh_lib::crypto::encrypt(&json_data, &pw)?;
-    json_data.clear();
-
     let sync = rssh_lib::sync::github::GitHubSync::from_settings(&token, &repo, &branch)?;
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap_or_else(|e| die(format!("Tokio runtime: {e}")));
-    rt.block_on(sync.push(&encrypted))?;
+    push_remote_backup(conn, &sync)?;
     println!("Pushed to GitHub.");
     Ok(())
 }
 
 fn config_github_pull(conn: &CliCtx) -> AppResult<()> {
     let (token, repo, branch) = read_github_settings(conn)?;
-
     let sync = rssh_lib::sync::github::GitHubSync::from_settings(&token, &repo, &branch)?;
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap_or_else(|e| die(format!("Tokio runtime: {e}")));
-    let encrypted = rt.block_on(sync.pull())?;
-
-    let pw = read_password("Decryption password: ");
-    let json = rssh_lib::crypto::decrypt(&encrypted, &pw)?;
-    // pull: additive merge (no destructive clear) — same as the GUI.
-    import_config_json(conn, &json)?;
+    pull_remote_backup(conn, &sync)?;
     println!("Pulled from GitHub.");
     Ok(())
 }
@@ -240,45 +251,16 @@ fn config_webdav_set(conn: &CliCtx) -> AppResult<()> {
 
 fn config_webdav_push(conn: &CliCtx) -> AppResult<()> {
     let (url, username, password) = read_webdav_settings(conn)?;
-
-    let ss: &dyn SecretStore = conn.secret_store().as_ref();
-    let prefs = rssh_lib::sync::config::read_sync_prefs(conn)?;
-    let payload = rssh_lib::sync::config::build_payload(
-        conn,
-        ss,
-        &conn.data_dir,
-        &rssh_lib::sync::config::ExportMode::RemotePush(prefs),
-    )?;
-    let mut json_data = serde_json::to_string_pretty(&payload)
-        .unwrap_or_else(|e| die(format!("Serialization failed: {e}")));
-
-    let pw = read_password("Encryption password: ");
-    let encrypted = rssh_lib::crypto::encrypt(&json_data, &pw)?;
-    json_data.clear();
-
     let sync = rssh_lib::sync::webdav::WebDavSync::from_settings(&url, &username, &password)?;
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap_or_else(|e| die(format!("Tokio runtime: {e}")));
-    rt.block_on(sync.push(&encrypted))?;
+    push_remote_backup(conn, &sync)?;
     println!("Pushed to WebDAV.");
     Ok(())
 }
 
 fn config_webdav_pull(conn: &CliCtx) -> AppResult<()> {
     let (url, username, password) = read_webdav_settings(conn)?;
-
     let sync = rssh_lib::sync::webdav::WebDavSync::from_settings(&url, &username, &password)?;
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap_or_else(|e| die(format!("Tokio runtime: {e}")));
-    let encrypted = rt.block_on(sync.pull())?;
-
-    let pw = read_password("Decryption password: ");
-    let json = rssh_lib::crypto::decrypt(&encrypted, &pw)?;
-    import_config_json(conn, &json)?;
+    pull_remote_backup(conn, &sync)?;
     println!("Pulled from WebDAV.");
     Ok(())
 }
