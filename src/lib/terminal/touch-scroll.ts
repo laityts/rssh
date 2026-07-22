@@ -95,12 +95,13 @@ const PAUSE_MS = 60;      // finger paused longer than this before release → n
  * touch cancels any in-flight fling (grab-to-stop, like native lists).
  * Caller decides when to install it (e.g. mobile only).
  *
- * `suppressArrowInput`, when supplied and returning true, gates OFF the pager
- * arrow-key path (alt-screen, no mouse tracking) for the duration of the check
- * — the gesture then scrolls nothing rather than injecting ↑/↓ into the PTY.
- * Wheel and scrollback are never gated: wheel means the app explicitly asked
- * for mouse reports, and scrollback never touches PTY input. Use it to stop a
- * scroll from clobbering the input line while the user is composing / typing.
+ * `suppressArrowInput`, when supplied, is sampled at touchstart and gates OFF
+ * the pager arrow-key path (alt-screen, no mouse tracking) for that whole drag
+ * and its fling — the gesture then scrolls nothing rather than injecting ↑/↓
+ * into the PTY. Wheel and scrollback are never gated: wheel means the app
+ * explicitly asked for mouse reports, and scrollback never touches PTY input.
+ * Use it to stop a scroll from clobbering the input line while the user is
+ * composing / typing.
  */
 export function setupTouchScroll(
   host: HTMLElement,
@@ -117,6 +118,7 @@ export function setupTouchScroll(
   let velocity = 0;    // px/ms, recent-biased; sign = drag direction (dy)
   let lastMoveTime = 0;
   let inertiaRaf = 0;  // rAF handle, 0 = no fling running (invariant I1)
+  let suppressArrowsForGesture = false;
 
   // Row height is constant within a gesture (font can't change mid-drag), so sample
   // it ONCE at takeover, not per frame: reading offsetHeight while xterm is repainting
@@ -179,7 +181,7 @@ export function setupTouchScroll(
       // terminal state. So when the user is actively typing (IME composing /
       // soft keyboard up), suppress the injection: no scroll beats a garbled
       // input box. Real pagers don't hold an open text field, so nothing lost.
-      if (suppressArrowInput?.()) return;
+      if (suppressArrowsForGesture) return;
       const seq = arrowSeq(up, terminal.modes.applicationCursorKeysMode);
       terminal.input(seq.repeat(count), true);
     }
@@ -209,7 +211,12 @@ export function setupTouchScroll(
     // disqualifies the gesture until ALL fingers lift and a fresh single touch
     // begins — never scroll from stale coordinates.
     ignore = e.touches.length !== 1;
+    suppressArrowsForGesture = false;
     if (ignore) return;
+    // Snapshot before the mobile pointer handler can blur the helper when this
+    // same gesture crosses its move threshold. Re-reading focus during the drag
+    // would lose the fact that the user was typing when the gesture began.
+    suppressArrowsForGesture = suppressArrowInput?.() ?? false;
     startY = lastY = e.touches[0].clientY;
     lastX = e.touches[0].clientX;
     lastMoveTime = performance.now();

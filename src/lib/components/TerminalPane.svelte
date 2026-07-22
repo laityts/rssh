@@ -1522,7 +1522,8 @@
             // suppressArrowInput：备用屏无鼠标追踪的 app 靠注入 ↑/↓ 滚动，但那是
             // 真实 PTY 输入。用户正在打字（IME 组字 / 软键盘弹起 → helper 持有焦点）
             // 时抑制注入，否则滚动手势会给绑定 ↑/↓ 到历史回溯的 app 灌回上一条输入，
-            // 把输入框搞乱。组字必然要求 helper focus，所以焦点检查已覆盖 IME 场景。
+            // 把输入框搞乱。setupTouchScroll 会在 touchstart 锁存这个焦点状态，避免
+            // 同一拖动触发 hideKeyboard() 后 helper 失焦、后续帧又漏注入方向键。
             mobileTouchScrollCleanup = setupTouchScroll(
                 containerEl,
                 terminal,

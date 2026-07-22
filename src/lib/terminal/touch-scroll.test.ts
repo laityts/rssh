@@ -1,5 +1,132 @@
-import { describe, it, expect } from "vitest";
-import { accumulateScroll, resolveScrollTarget, arrowSeq } from "./touch-scroll.ts";
+import { afterEach, describe, it, expect, vi } from "vitest";
+import type { Terminal } from "@xterm/xterm";
+import { accumulateScroll, resolveScrollTarget, arrowSeq, setupTouchScroll } from "./touch-scroll.ts";
+
+type TouchListener = (event: TouchEvent) => void;
+
+class FakeTouchHost {
+  private readonly listeners = new Map<string, Set<TouchListener>>();
+  private readonly row = { offsetHeight: 20 };
+
+  addEventListener(type: string, listener: EventListenerOrEventListenerObject): void {
+    if (typeof listener !== "function") throw new Error("test host only supports function listeners");
+    const listeners = this.listeners.get(type) ?? new Set<TouchListener>();
+    listeners.add(listener as TouchListener);
+    this.listeners.set(type, listeners);
+  }
+
+  removeEventListener(type: string, listener: EventListenerOrEventListenerObject): void {
+    if (typeof listener !== "function") return;
+    this.listeners.get(type)?.delete(listener as TouchListener);
+  }
+
+  querySelector(): { firstElementChild: { offsetHeight: number } } {
+    return { firstElementChild: this.row };
+  }
+
+  fire(type: string, event: TouchEvent): void {
+    for (const listener of this.listeners.get(type) ?? []) listener(event);
+  }
+}
+
+function touchEvent(y: number): TouchEvent {
+  return {
+    touches: [{ clientX: 10, clientY: y }],
+    preventDefault() {},
+  } as unknown as TouchEvent;
+}
+
+function touchEndEvent(): TouchEvent {
+  return {
+    touches: [],
+  } as unknown as TouchEvent;
+}
+
+function alternateScreenTerminal(input: string[]): Terminal {
+  return {
+    modes: {
+      mouseTrackingMode: "none",
+      applicationCursorKeysMode: false,
+    },
+    buffer: { active: { type: "alternate" } },
+    input(data: string) {
+      input.push(data);
+    },
+  } as unknown as Terminal;
+}
+
+describe("setupTouchScroll", () => {
+  afterEach(() => vi.unstubAllGlobals());
+
+  it("keeps pager arrows suppressed when typing focus is lost during the drag", () => {
+    const host = new FakeTouchHost();
+    const input: string[] = [];
+    let typing = true;
+    const cleanup = setupTouchScroll(
+      host as unknown as HTMLElement,
+      alternateScreenTerminal(input),
+      () => typing,
+    );
+
+    host.fire("touchstart", touchEvent(100));
+    typing = false; // the mobile pointer handler blurs the helper at the same drag threshold
+    host.fire("touchmove", touchEvent(125));
+
+    expect(input).toEqual([]);
+    cleanup();
+  });
+
+  it("keeps pager arrows suppressed through the gesture inertia", () => {
+    let nextFrame: FrameRequestCallback | undefined;
+    let nextHandle = 1;
+    vi.stubGlobal("requestAnimationFrame", (callback: FrameRequestCallback) => {
+      nextFrame = callback;
+      return nextHandle++;
+    });
+    vi.stubGlobal("cancelAnimationFrame", () => {});
+
+    const host = new FakeTouchHost();
+    const input: string[] = [];
+    let typing = true;
+    const cleanup = setupTouchScroll(
+      host as unknown as HTMLElement,
+      alternateScreenTerminal(input),
+      () => typing,
+    );
+
+    host.fire("touchstart", touchEvent(100));
+    typing = false;
+    host.fire("touchmove", touchEvent(125));
+    host.fire("touchend", touchEndEvent());
+    const inertiaFrame = nextFrame;
+    if (!inertiaFrame) throw new Error("expected the drag to schedule an inertia frame");
+    inertiaFrame(performance.now() + 16);
+
+    expect(input).toEqual([]);
+    cleanup();
+  });
+
+  it("samples arrow suppression again for the next touch gesture", () => {
+    const host = new FakeTouchHost();
+    const input: string[] = [];
+    let typing = true;
+    const cleanup = setupTouchScroll(
+      host as unknown as HTMLElement,
+      alternateScreenTerminal(input),
+      () => typing,
+    );
+
+    host.fire("touchstart", touchEvent(100));
+    typing = false;
+    host.fire("touchmove", touchEvent(125));
+    host.fire("touchcancel", touchEndEvent());
+    host.fire("touchstart", touchEvent(100));
+    host.fire("touchmove", touchEvent(125));
+
+    expect(input).toEqual(["\x1b[A"]);
+    cleanup();
+  });
+});
 
 describe("resolveScrollTarget", () => {
   it("routes a plain shell (scrollback, no alt, no mouse) to scrollback", () => {
